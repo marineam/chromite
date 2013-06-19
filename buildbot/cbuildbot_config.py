@@ -248,7 +248,8 @@ _settings = dict(
 
 # sync_chrome -- Does this profile need to sync chrome?  If None, we guess based
 #                on other factors.  If True/False, we always do that.
-  sync_chrome=None,
+  #sync_chrome=None,
+  sync_chrome=False,
 
 # nowithdebug -- Pass the --nowithdebug flag to build_packages (sets the
 #                -DNDEBUG compiler flag).
