@@ -217,6 +217,9 @@ class RepoRepository(object):
     if self.branch:
       init_cmd.extend(['--manifest-branch', self.branch])
 
+    # TODO(marineam): make this a command line option
+    init_cmd.extend(['-g', 'minilayout'])
+
     cros_build_lib.RunCommand(init_cmd, cwd=self.directory, input='\n\ny\n')
     if local_manifest and local_manifest != self._manifest:
       self._SwitchToLocalManifest(local_manifest)

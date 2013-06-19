@@ -52,6 +52,7 @@ GERRIT_INT_PORT = '29419'
 GERRIT_HOST = 'gerrit.chromium.org'
 GERRIT_INT_HOST = 'gerrit-int.chromium.org'
 GIT_HOST = 'git.chromium.org'
+GITHUB_HOST = 'github.com'
 
 # TODO(szager): Deprecate these variables in favor of (PUBLIC|INTERNAL)_GOB_*
 # once the migration to git-on-borg is complete.  Leaving them intact now to
@@ -65,17 +66,19 @@ else:
   GERRIT_INT_SSH_URL = 'ssh://%s:%s' % (GERRIT_INT_HOST, GERRIT_INT_PORT)
   GIT_HTTP_URL = 'http://%s/git' % GIT_HOST
 
+GITHUB_HTTP_URL = 'https://%s' % GITHUB_HOST
+
 REPO_PROJECT = 'external/repo'
 REPO_URL = '%s/%s' % (GIT_HTTP_URL, REPO_PROJECT)
 
-CHROMITE_PROJECT = 'chromiumos/chromite'
-CHROMITE_URL = '%s/%s' % (GIT_HTTP_URL, CHROMITE_PROJECT)
+CHROMITE_PROJECT = 'coreos/chromite'
+CHROMITE_URL = '%s/%s' % (GITHUB_HTTP_URL, CHROMITE_PROJECT)
 CHROMIUM_SRC_PROJECT = 'chromium/src'
 
-MANIFEST_PROJECT = 'chromiumos/manifest'
+MANIFEST_PROJECT = 'coreos/manifest'
 MANIFEST_INT_PROJECT = 'chromeos/manifest-internal'
 
-MANIFEST_URL = '%s/%s' % (GIT_HTTP_URL, MANIFEST_PROJECT)
+MANIFEST_URL = '%s/%s' % (GITHUB_HTTP_URL, MANIFEST_PROJECT)
 MANIFEST_INT_URL = '%s/%s' % (GERRIT_INT_SSH_URL, MANIFEST_INT_PROJECT)
 
 DEFAULT_MANIFEST = 'default.xml'
