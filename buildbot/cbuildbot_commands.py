@@ -235,6 +235,9 @@ def MakeChroot(buildroot, replace, use_sdk, chrome_root=None, extra_env=None):
   if chrome_root:
     cmd.append('--chrome_root=%s' % chrome_root)
 
+  # Hack, use local sdk tarball...
+  cmd.append('-u /src/coreos/cros-sdk-2013.03.07.000000.fix-tmp.tar.xz')
+
   _RunBuildScript(buildroot, cmd, extra_env=extra_env)
 
 
