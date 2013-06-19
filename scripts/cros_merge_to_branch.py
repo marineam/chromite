@@ -4,7 +4,7 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
-""" This simple program takes changes from gerrit/gerrit-int and creates new
+"""This simple program takes changes from gerrit/gerrit-int and creates new
 changes for them on the desired branch using your gerrit/ssh credentials. To
 specify a change on gerrit-int, you must prefix the change with a *.
 
@@ -31,8 +31,7 @@ from gerrit-int, you must prefix the gerrit change number with a * e.g.
 
 For more information on how to do this yourself you can go here:
 http://dev.chromium.org/chromium-os/how-tos-and-troubleshooting/working-on-a-br\
-anch
-"""
+anch"""
 
 import errno
 import logging
@@ -52,7 +51,7 @@ from chromite.lib import patch as cros_patch
 
 
 _USAGE = """
-cros_merge_to_branch [*]change_number1 [[*]change_number2 ...] branch\n\n %s
+cros_merge_to_branch [*]change_number1 [[*]change_number2 ...] branch\n\n%s\
 """ % __doc__
 
 
@@ -60,19 +59,19 @@ def _GetParser():
   """Returns the parser to use for this module."""
   parser = commandline.OptionParser(usage=_USAGE)
   parser.add_option('-d', '--draft', default=False, action='store_true',
-                    help='Upload a draft to Gerrit rather than a change.')
+                    help='upload a draft to Gerrit rather than a change')
   parser.add_option('-n', '--dry-run', default=False, action='store_true',
                     dest='dryrun',
-                    help='Apply changes locally but do not upload them.')
+                    help='apply changes locally but do not upload them')
   parser.add_option('-e', '--email',
-                    help='If specified, use this email instead of '
-                    'the email you would upload changes as. Must be set if '
-                    'nomirror is set.')
+                    help='if specified, use this email instead of '
+                    'the email you would upload changes as; must be set w/'
+                    '--nomirror')
   parser.add_option('--nomirror', default=True, dest='mirror',
-                    action='store_false', help='Disable mirroring -- requires '
-                    'email to be set.')
+                    action='store_false', help='checkout git repo directly; '
+                    'requires --email')
   parser.add_option('--nowipe', default=True, dest='wipe', action='store_false',
-                    help='Do not wipe the work directory after finishing.')
+                    help='do not wipe the work directory after finishing')
   return parser
 
 
@@ -99,31 +98,31 @@ def _UploadChangeToBranch(work_dir, patch, branch, draft, dryrun):
   new_sha1 = git.GetGitRepoRevision(work_dir)
   reviewers = set()
 
-  # If the sha1 has changed, then rewrite the commit message.
-  if patch.sha1 != new_sha1:
-    msg = []
-    for line in patch.commit_message.splitlines():
-      if line.startswith('Reviewed-on: '):
-        line = 'Previous-' + line
-      elif line.startswith('Commit-Ready: ') or \
-           line.startswith('Commit-Queue: ') or \
-           line.startswith('Reviewed-by: ') or \
-           line.startswith('Tested-by: '):
-        # If the tag is malformed, or the person lacks a name,
-        # then that's just too bad -- throw it away.
-        ele = re.split('[<>@]+', line)
-        if len(ele) == 4:
-          reviewers.add('@'.join(ele[-3:-1]))
-        continue
-      msg.append(line)
-    msg += [
-        '(cherry picked from commit %s)' % patch.sha1,
-    ]
-    git.RunGit(work_dir, ['commit', '--amend', '-F', '-'],
-               input='\n'.join(msg).encode('utf8'))
+  # Rewrite the commit message all the time.  Latest gerrit doesn't seem
+  # to like it when you use the same ChangeId on different branches.
+  msg = []
+  for line in patch.commit_message.splitlines():
+    if line.startswith('Reviewed-on: '):
+      line = 'Previous-' + line
+    elif line.startswith('Commit-Ready: ') or \
+         line.startswith('Commit-Queue: ') or \
+         line.startswith('Reviewed-by: ') or \
+         line.startswith('Tested-by: '):
+      # If the tag is malformed, or the person lacks a name,
+      # then that's just too bad -- throw it away.
+      ele = re.split(r'[<>@]+', line)
+      if len(ele) == 4:
+        reviewers.add('@'.join(ele[-3:-1]))
+      continue
+    msg.append(line)
+  msg += [
+    '(cherry picked from commit %s)' % patch.sha1,
+  ]
+  git.RunGit(work_dir, ['commit', '--amend', '-F', '-'],
+             input='\n'.join(msg).encode('utf8'))
 
-    # Get the new sha1 after rewriting the commit message.
-    new_sha1 = git.GetGitRepoRevision(work_dir)
+  # Get the new sha1 after rewriting the commit message.
+  new_sha1 = git.GetGitRepoRevision(work_dir)
 
   # Create and use a LocalPatch to Upload the change to Gerrit.
   local_patch = cros_patch.LocalPatch(
@@ -131,17 +130,16 @@ def _UploadChangeToBranch(work_dir, patch, branch, draft, dryrun):
       patch.tracking_branch, patch.remote, new_sha1)
   for reviewers in (reviewers, ()):
     try:
-      ret = local_patch.Upload(
+      return local_patch.Upload(
           patch.project_url, 'refs/%s/%s' % (upload_type, branch),
           carbon_copy=False, dryrun=dryrun, reviewers=reviewers)
     except cros_build_lib.RunCommandError as e:
       if (e.result.returncode == 128 and
-          re.search('fatal: user ".*?" not found', e.result.error)):
+          re.search(r'fatal: user ".*?" not found', e.result.error)):
         logging.warning('Some reviewers were not found (%s); '
                         'dropping them & retrying upload', ' '.join(reviewers))
         continue
       raise
-  return ret
 
 
 def _SetupWorkDirectoryForPatch(work_dir, patch, branch, manifest, email):

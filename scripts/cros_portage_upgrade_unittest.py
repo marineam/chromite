@@ -2696,8 +2696,8 @@ class VerifyPackageTest(CpuTestBase):
     mocked_upgrader._GetBoardCmd('equery').AndReturn('equery')
     run_result = RunCommandResult(returncode=0,
                                   output=ebuild_path)
-    cros_build_lib.RunCommand(['equery', 'which', '--include-masked', cpv],
-                              error_code_ok=True,
+    cros_build_lib.RunCommand(['equery', '-C', 'which', '--include-masked',
+                               cpv], error_code_ok=True,
                               extra_env=envvars, print_cmd=False,
                               redirect_stdout=True, combine_stdout_stderr=True,
                               ).AndReturn(run_result)
@@ -2751,7 +2751,8 @@ class VerifyPackageTest(CpuTestBase):
     mocked_upgrader._GetBoardCmd('equery').AndReturn('equery')
     run_result = RunCommandResult(returncode=0,
                                   output=output)
-    cros_build_lib.RunCommand(['equery', '--no-pipe', 'list', '-op', cpv],
+    cros_build_lib.RunCommand(['equery', '-qCN', 'list', '-F',
+                               '$mask|$cpv:$slot', '-op', cpv],
                               error_code_ok=True,
                               extra_env='envvars', print_cmd=False,
                               redirect_stdout=True, combine_stdout_stderr=True,
@@ -2763,28 +2764,28 @@ class VerifyPackageTest(CpuTestBase):
     self.mox.VerifyAll()
 
   def testGetMaskBitsUnmaskedStable(self):
-    output = '[-P-] [  ] foo/bar-2.7.0:0'
+    output = '  |foo/bar-2.7.0:0'
     pinfo = cpu.PInfo(upgraded_cpv='foo/bar-2.7.0')
     self._TestSetUpgradedMaskBits(pinfo, output)
     self.assertTrue(pinfo.upgraded_unmasked)
     self.assertTrue(pinfo.upgraded_stable)
 
   def testGetMaskBitsUnmaskedUnstable(self):
-    output = '[-P-] [ ~] foo/bar-2.7.3:0'
+    output = ' ~|foo/bar-2.7.3:0'
     pinfo = cpu.PInfo(upgraded_cpv='foo/bar-2.7.3')
     self._TestSetUpgradedMaskBits(pinfo, output)
     self.assertTrue(pinfo.upgraded_unmasked)
     self.assertFalse(pinfo.upgraded_stable)
 
   def testGetMaskBitsMaskedStable(self):
-    output = '[-P-] [M ] foo/bar-2.7.4:0'
+    output = 'M |foo/bar-2.7.4:0'
     pinfo = cpu.PInfo(upgraded_cpv='foo/bar-2.7.4')
     self._TestSetUpgradedMaskBits(pinfo, output)
     self.assertFalse(pinfo.upgraded_unmasked)
     self.assertTrue(pinfo.upgraded_stable)
 
   def testGetMaskBitsMaskedUnstable(self):
-    output = '[-P-] [M~] foo/bar-2.7.4-r1:0'
+    output = 'M~|foo/bar-2.7.4-r1:0'
     pinfo = cpu.PInfo(upgraded_cpv='foo/bar-2.7.4-r1')
     self._TestSetUpgradedMaskBits(pinfo, output)
     self.assertFalse(pinfo.upgraded_unmasked)
@@ -2948,7 +2949,7 @@ class CommitTest(CpuTestBase):
     # -- Body corresponding to upgrade_lines
     # -- BUG= line (with space after '=' to invalidate it)
     # -- TEST= line (with space after '=' to invalidate it)
-    body = r'\n'.join([re.sub('\s+', r'\s', line) for line in upgrade_lines])
+    body = r'\n'.join([re.sub(r'\s+', r'\s', line) for line in upgrade_lines])
     regexp = re.compile(r'''^efg:\supgraded\spackage\sto\supstream\n # Summary
                             ^\s*\n                            # Blank line
                             %s\n                              # Body
@@ -2972,7 +2973,7 @@ class CommitTest(CpuTestBase):
     # -- Body corresponding to upgrade_lines
     # -- BUG= line (with space after '=' to invalidate it)
     # -- TEST= line (with space after '=' to invalidate it)
-    body = r'\n'.join([re.sub('\s+', r'\s', line) for line in upgrade_lines])
+    body = r'\n'.join([re.sub(r'\s+', r'\s', line) for line in upgrade_lines])
     regexp = re.compile(r'''^efg,\spqr,\suvw:\supgraded\spackages.*\n # Summary
                             ^\s*\n                            # Blank line
                             %s\n                              # Body
@@ -3002,7 +3003,7 @@ class CommitTest(CpuTestBase):
     # -- Body corresponding to upgrade_lines
     # -- BUG= line (with space after '=' to invalidate it)
     # -- TEST= line (with space after '=' to invalidate it)
-    body = r'\n'.join([re.sub('\s+', r'\s', line) for line in upgrade_lines])
+    body = r'\n'.join([re.sub(r'\s+', r'\s', line) for line in upgrade_lines])
     regexp = re.compile(r'''^Upgraded\s.*10.*\spackages\n     # Summary
                             ^\s*\n                            # Blank line
                             %s\n                              # Body
@@ -3152,14 +3153,13 @@ class ResolveAndVerifyArgsTest(CpuTestBase):
       args.append(arg)
 
       catpkg = cpu.Upgrader._GetCatPkgFromCpv(arg)
-      verrev = cpu.Upgrader._GetVerRevFromCpv(arg)
       local_arg = catpkg if catpkg else arg
 
       mocked_upgrader._FindCurrentCPV(local_arg).AndReturn(local_cpv)
       mocked_upgrader._FindUpstreamCPV(arg, mocked_upgrader._unstable_ok,
                                        ).AndReturn(upstream_cpv)
 
-      if not upstream_cpv and verrev:
+      if not upstream_cpv and upgrade_mode:
         # Real method raises an exception here.
         if not mocked_upgrader._unstable_ok:
           mocked_upgrader._FindUpstreamCPV(arg, True).AndReturn(arg)
@@ -3244,14 +3244,23 @@ class ResolveAndVerifyArgsTest(CpuTestBase):
                                            error=RuntimeError,
                                            error_checker=_error_checker)
 
-  def testResolveAndVerifyArgsNonWorldLocalOnly(self):
+  def testResolveAndVerifyArgsNonWorldLocalOny(self):
     pinfolist = [cpu.PInfo(user_arg='dev-libs/B',
                            cpv='dev-libs/B-1',
                            ),
                  ]
     cmdargs = ['--upgrade', '--unstable-ok']
-    result = self._TestResolveAndVerifyArgsNonWorld(pinfolist, cmdargs)
-    self.assertEquals(result, pinfolist)
+
+    def _error_checker(exception):
+      # RuntimeError text should start with 'Unable to find'.
+      text = str(exception)
+      phrase = 'Unable to find'
+      msg = 'Error message expected to start with "%s": %s' % (phrase, text)
+      return (text.startswith(phrase), msg)
+
+    self._TestResolveAndVerifyArgsNonWorld(pinfolist, cmdargs,
+                                           error=RuntimeError,
+                                           error_checker=_error_checker)
 
   def testResolveAndVerifyArgsNonWorldUpstreamOnly(self):
     pinfolist = [cpu.PInfo(user_arg='dev-libs/B',

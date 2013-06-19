@@ -117,10 +117,11 @@ class RecordedTraceback(object):
 class _Results(object):
   """Static class that collects the results of our BuildStages as they run."""
 
-  # Stored in the results log for a stage skipped because it was previously
-  # completed successfully.
   SUCCESS = "Stage was successful"
   FORGIVEN = "Stage failed but was optional"
+  SKIPPED = "Stage was skipped"
+  NON_FAILURE_TYPES = (SUCCESS, FORGIVEN, SKIPPED)
+
   SPLIT_TOKEN = "\_O_/"
 
   def __init__(self):
@@ -131,6 +132,8 @@ class _Results(object):
     # Stages run in a previous run and restored. Stored as a dictionary of
     # names to previous records.
     self._previous = {}
+
+    self.start_time = datetime.datetime.now()
 
   def Clear(self):
     """Clear existing stage results."""
@@ -151,13 +154,13 @@ class _Results(object):
     """
     for entry in self._results_log:
       _, result, _, _ = entry
-      if not result in (self.SUCCESS, self.FORGIVEN):
+      if result not in self.NON_FAILURE_TYPES:
         return False
 
     return True
 
   def WasStageSuccessful(self, name):
-    """Return true stage passed."""
+    """Return true if stage passed."""
     cros_build_lib.Info('Checking for %s' % name)
     for entry in self._results_log:
       entry, result, _, _ = entry
@@ -167,6 +170,10 @@ class _Results(object):
 
     return False
 
+  def StageHasResults(self, name):
+    """Return true if stage has posted results."""
+    return name in [entry[0] for entry in self._results_log]
+
   def Record(self, name, result, description=None, time=0):
     """Store off an additional stage result.
 
@@ -175,7 +182,9 @@ class _Results(object):
          result:
            Result should be one of:
              Results.SUCCESS if the stage was successful.
-             The exception the stage errored with.
+             Results.SKIPPED if the stage was skipped.
+             Results.FORGIVEN if the stage had warnings.
+             Otherwise, it should be the exception stage errored with.
          description:
            The textual backtrace of the exception, or None
     """
@@ -186,10 +195,8 @@ class _Results(object):
 
        Args:
          name: The name of the stage
-         result:
-           Result should be Results.SUCCESS if the stage was successful
-             otherwise the exception the stage errored with.
-          description:
+         result: See docstring for Record above.
+         description:
            The textual backtrace of the exception, or None
     """
     for index in range(len(self._results_log)):
@@ -242,10 +249,10 @@ class _Results(object):
        A list of RecordedTraceback objects.
     """
     for name, result, description, _ in self._results_log:
-      # If result is not SUCCESS or FORGIVEN, then the stage failed, and
+      # If result is not in NON_FAILURE_TYPES, then the stage failed, and
       # result is the exception object and description is a string containing
       # the full traceback.
-      if result not in (self.SUCCESS, self.FORGIVEN):
+      if result not in self.NON_FAILURE_TYPES:
         yield RecordedTraceback(name, result, description)
 
   def Report(self, out, archive_urls=None, current_version=None):
@@ -267,6 +274,10 @@ class _Results(object):
 
     for name, result, _, run_time in results:
       timestr = datetime.timedelta(seconds=math.ceil(run_time))
+
+      # Don't print data on skipped stages.
+      if result == self.SKIPPED:
+        continue
 
       out.write(line)
       details = ''
@@ -296,8 +307,9 @@ class _Results(object):
     if archive_urls:
       out.write('%s BUILD ARTIFACTS FOR THIS BUILD CAN BE FOUND AT:\n' % edge)
       for board, url in sorted(archive_urls.iteritems()):
-        out.write('%s  %s: %s\n' % (edge, board, url))
-        out.write('@@@STEP_LINK@Artifacts[%s]@%s@@@\n' % (board, url))
+        out.write('%s  %s: %s' % (edge, board, url))
+        cros_build_lib.PrintBuildbotLink('Artifacts[%s]' % board, url,
+                                         handle=out)
       out.write(line)
 
     for x in self.GetTracebacks():

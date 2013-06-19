@@ -76,7 +76,6 @@ class PatchAlreadyApplied(ApplyPatchException):
 
 
 class DependencyError(PatchException):
-
   """Exception thrown when a change cannot be applied due to a failure in a
   dependency."""
 
@@ -361,7 +360,7 @@ def FormatPatchDep(text, force_internal=False, force_external=False,
     changeId: If False, throw ValueError if the dep is a ChangeId.
     gerrit_number: If False, throw ValueError if the dep is a gerrit number.
     allow_CL: If True, allow CL: prefix; else view it as an error.
-      That format is primarily used for -g, and in CQ-Depend.
+      That format is primarily used for -g, and in CQ-DEPEND.
   """
   if not text:
     raise ValueError("FormatPatchDep invoked with an empty value: %r"
@@ -403,6 +402,25 @@ def FormatPatchDep(text, force_internal=False, force_external=False,
                 force_external=force_external, strict=strict)
 
 
+def GetPaladinDeps(commit_message):
+  """Get the paladin dependencies for the given |commit_message|."""
+  PALADIN_DEPENDENCY_RE = re.compile(r'^(CQ\W?DEPEND.)(.*)$',
+                                     re.MULTILINE | re.IGNORECASE)
+  PATCH_RE = re.compile('[^, ]+')
+  EXPECTED_PREFIX = 'CQ-DEPEND='
+  matches = PALADIN_DEPENDENCY_RE.findall(commit_message)
+  dependencies = []
+  for prefix, match in matches:
+    if prefix != EXPECTED_PREFIX:
+      msg = 'Expected %r, but got %r' % (EXPECTED_PREFIX, prefix)
+      raise ValueError(msg)
+    for chunk in PATCH_RE.findall(match):
+      chunk = FormatPatchDep(chunk, sha1=False, allow_CL=True)
+      if chunk not in dependencies:
+        dependencies.append(chunk)
+  return dependencies
+
+
 class GitRepoPatch(object):
   """Representing a patch from a branch of a local or remote git repository."""
 
@@ -414,7 +432,6 @@ class GitRepoPatch(object):
   _STRICT_VALID_CHANGE_ID_RE = re.compile(r'^I[0-9a-fA-F]{40}$')
   _GIT_CHANGE_ID_RE = re.compile(r'^Change-Id:[\t ]*(\w+)\s*$',
                                  re.I | re.MULTILINE)
-  _PALADIN_DEPENDENCY_RE = re.compile(r'^CQ-DEPEND=(.*)$', re.MULTILINE)
 
   def __init__(self, project_url, project, ref, tracking_branch, remote,
                sha1=None, change_id=None):
@@ -496,7 +513,7 @@ class GitRepoPatch(object):
       output = ret.output.split('\0')
       if len(output) != 3:
         return None, None, None
-      return [x.strip() for x in output]
+      return [unicode(x.strip(), 'ascii', 'ignore') for x in output]
 
     if self.sha1 is not None:
       # See if we've already got the object.
@@ -698,69 +715,13 @@ class GitRepoPatch(object):
     self.Apply(manifest.GetProjectPath(self.project, True),
                manifest_branch, trivial=trivial)
 
-  def GerritDependencies(self, git_repo, upstream):
-    """Returns an ordered list of dependencies from Gerrit.
+  def GerritDependencies(self):
+    """Returns a list of Gerrit change numbers that this patch depends on.
 
-    The list of changes are in order from FETCH_HEAD back to m/master.
-
-    Arguments:
-      git_repo: The git repository to fetch/access this commit from.
-    Returns:
-      An ordered list of Gerrit ChangeIds that this patch depends on.
-      Note that if the commit lacks a ChangeId, the parent's sha1 is returned.
+    Ordinary patches have no Gerrit-style dependencies since they're not
+    from Gerrit at all. See GerritPatch.GerritDependencies instead.
     """
-    dependencies = []
-    logging.debug('Checking for Gerrit dependencies for change %s', self)
-
-    rev = self.Fetch(git_repo)
-
-    try:
-      return_obj = git.RunGit(
-          git_repo, ['log', '-z', '-n1', '--pretty=format:%H%n%B',
-                     '%s..%s^' % (upstream, rev)])
-    except cros_build_lib.RunCommandError, e:
-      if e.result.returncode != 128:
-        raise
-      # Errorcode 128 means "object not found"; either we've got an
-      # internal bug (tracking_branch was wrong, fetch somehow didn't get
-      # that actual rev, etc), or... this is the first commit in a repository.
-      # The following code checks for that, raising the original
-      # exception if not.
-      result = git.RunGit(git_repo, ['rev-list', '-n2', rev])
-      if len(result.output.split()) != 1:
-        raise
-      # First commit of a repository; obviously, it has no dependencies.
-      return []
-
-    patches = []
-    if return_obj.output:
-      # Only do this if we have output; else it leads
-      # to an invalid [''] result which we can't identify
-      # as differing from actual output for a single patch that
-      # lacks a commit message.
-      # Because the explicit null addition, strip off the last record.
-      patches = return_obj.output.split('\0')
-
-    for patch_output in patches:
-      sha1, commit_msg = patch_output.split('\n', 1)
-      try:
-        dep = FormatChangeId(self._ParseChangeId(commit_msg),
-                             force_internal=self.internal, strict=True)
-      except BrokenChangeID, e:
-        if not e.missing:
-          raise
-        cros_build_lib.Warning(
-            "Parent %s lacks a ChangeId; using the parent's sha1 as the "
-            "dependency.", sha1)
-        dep = FormatSha1(sha1, force_internal=self.internal, strict=True)
-      dependencies.append(dep)
-
-    if dependencies:
-      logging.debug('Found %s Gerrit dependencies for change %s', dependencies,
-                   self)
-      # Ensure that our parent's ChangeId's are internal if we are.
-
-    return dependencies
+    return []
 
   def _SetChangeId(self, change_id):
     """Set this instances change_id, and id from the given ChangeId.
@@ -805,7 +766,7 @@ class GitRepoPatch(object):
     this is left up to the invoker.
     """
     # Grab just the last pararaph.
-    git_metadata = re.split('\n{2,}', data.rstrip())[-1]
+    git_metadata = re.split(r'\n{2,}', data.rstrip())[-1]
     change_id_match = self._GIT_CHANGE_ID_RE.findall(git_metadata)
     if not change_id_match:
       raise BrokenChangeID(self, 'Missing Change-Id in %s' % (data,),
@@ -828,7 +789,7 @@ class GitRepoPatch(object):
     Parses the Commit message for this change looking for lines that follow
     the format:
 
-    CQ-DEPEND:change_num+ e.g.
+    CQ-DEPEND=change_num+ e.g.
 
     A commit which depends on a couple others.
 
@@ -839,20 +800,14 @@ class GitRepoPatch(object):
     dependencies = []
     logging.debug('Checking for CQ-DEPEND dependencies for change %s', self)
 
-    self.Fetch(git_repo)
+    # Only fetch the commit message if needed.
+    if self.commit_message is None:
+      self.Fetch(git_repo)
 
-    matches = self._PALADIN_DEPENDENCY_RE.findall(self.commit_message)
-    for match in matches:
-      chunks = ' '.join(match.split(','))
-      chunks = chunks.split()
-      for chunk in chunks:
-        try:
-          chunk = FormatPatchDep(chunk, sha1=False, allow_CL=True)
-        except ValueError, e:
-          raise BrokenCQDepends(self, chunk, str(e))
-
-        if chunk not in dependencies:
-          dependencies.append(chunk)
+    try:
+      dependencies = GetPaladinDeps(self.commit_message)
+    except ValueError as e:
+      raise BrokenCQDepends(self, str(e))
 
     if dependencies:
       logging.debug('Found %s Paladin dependencies for change %s', dependencies,
@@ -886,11 +841,9 @@ class GitRepoPatch(object):
 
     # Note the output of this ls-tree invocation is filename per line;
     # basically equivalent to ls -1.
-    conflicts = git.RunGit(
-        git_repo, ['ls-tree', '--full-name', '--name-only', '-z', tree_revision,
-                   '--'] + targets, error_code_ok=True).output.split('\0')[:-1]
-
-    return conflicts
+    cmd = ['ls-tree', '--full-name', '--name-only', '-z', tree_revision, '--']
+    output = git.RunGit(git_repo, cmd + targets, error_code_ok=True).output
+    return unicode(output, 'ascii', 'ignore').split('\0')[:-1]
 
   def __str__(self):
     """Returns custom string to identify this patch."""
@@ -1089,13 +1042,16 @@ class GerritPatch(GitRepoPatch):
     self.owner, _, _ = patch_dict['owner']['email'].partition('@')
     self.gerrit_number = FormatGerritNumber(str(patch_dict['number']),
                                             strict=True)
+    prefix_str = '*' if self.internal else ''
+    self.gerrit_number_str = '%s%s' % (prefix_str, self.gerrit_number)
     self.url = patch_dict['url']
     # status - Current state of this change.  Can be one of
     # ['NEW', 'SUBMITTED', 'MERGED', 'ABANDONED'].
     self.status = patch_dict['status']
-    approvals = self.patch_dict['currentPatchSet'].get('approvals', [])
+    self._approvals = self.patch_dict['currentPatchSet'].get('approvals', [])
     self.approval_timestamp = \
-        max(x['grantedOn'] for x in approvals) if approvals else 0
+        max(x['grantedOn'] for x in self._approvals) if self._approvals else 0
+    self.commit_message = patch_dict.get('commitMessage')
 
   def __reduce__(self):
     """Used for pickling to re-create patch object."""
@@ -1109,9 +1065,29 @@ class GerritPatch(GitRepoPatch):
                                 force_internal=self.internal))
     return l
 
+  def GerritDependencies(self):
+    """Returns the list of Gerrit change numbers that this patch depends on."""
+    return [FormatGerritNumber(d['number'], force_internal=self.internal)
+            for d in self.patch_dict.get('dependsOn', [])]
+
   def IsAlreadyMerged(self):
     """Returns whether the patch has already been merged in Gerrit."""
     return self.status == 'MERGED'
+
+  def HasApproval(self, field, value):
+    """Return whether the current patchset has the specified approval.
+
+    Args:
+      field: Which field to check.
+        'SUBM': Whether patch was submitted.
+        'VRIF': Whether patch was verified.
+        'CRVW': Whether patch was approved.
+        'COMR': Whether patch was marked ready.
+      value: The expected value of the specified field.
+    """
+    # All approvals default to '0', so use that if there's no matches.
+    type_approvals = [x['value'] for x in self._approvals if x['type'] == field]
+    return value in (type_approvals or ['0'])
 
   def _EnsureId(self, commit_message):
     """Ensure we have a usable Change-Id, validating what we received
@@ -1148,8 +1124,7 @@ class GerritPatch(GitRepoPatch):
 
   def __str__(self):
     """Returns custom string to identify this patch."""
-    s = '%s:%s%s' % (self.owner, '*' if self.internal else '',
-                     self.gerrit_number)
+    s = '%s:%s' % (self.owner, self.gerrit_number_str)
     if self.sha1 is not None:
       s = '%s:%s%s' % (s, '*' if self.internal else '', self.sha1[:8])
     if self._subject_line:

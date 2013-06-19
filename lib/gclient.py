@@ -64,7 +64,7 @@ def GetTipOfTrunkSvnRevision(svn_url):
   cmd = ['svn', 'info', svn_url]
   svn_info = cros_build_lib.RunCommand(cmd, redirect_stdout=True).output
 
-  revision_re = re.compile('^Revision:\s+(\d+)')
+  revision_re = re.compile(r'^Revision:\s+(\d+)')
   for line in svn_info.splitlines():
     match = revision_re.match(line)
     if match:
@@ -115,6 +115,7 @@ def _GetGclientSolutions(internal, use_pdf, rev):
       'svn_url': SVN_MIRROR_URL,
       'webkit_trunk': '%s/webkit-readonly/trunk' % SVN_MIRROR_URL,
       'googlecode_url': SVN_MIRROR_URL + '/%s',
+      'gsutil': SVN_MIRROR_URL + '/gsutil',
       'sourceforge_url': SVN_MIRROR_URL + '/%(repo)s'
     })
 

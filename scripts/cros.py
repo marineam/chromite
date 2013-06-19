@@ -2,8 +2,11 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
+import sys
+
 from chromite.cros import commands
 from chromite.lib import commandline
+from chromite.lib import stats
 
 
 def GetOptions(my_commands):
@@ -23,15 +26,30 @@ def GetOptions(my_commands):
   return parser
 
 
-def main(args):
+def _RunSubCommand(subcommand):
+  """Helper function for testing purposes."""
+  subcommand.Run()
+
+
+def main(argv):
   parser = GetOptions(commands.ListCommands())
   # Cros currently does nothing without a subcmd. Print help if no args are
   # specified.
-  if not args:
+  if not argv:
     parser.print_help()
     return 1
 
-  namespace = parser.parse_args(args)
+  namespace = parser.parse_args(argv)
   subcommand = namespace.cros_class(namespace)
-  subcommand.Run()
+  with stats.UploadContext() as queue:
+    if subcommand.upload_stats:
+      cmd_base = subcommand.options.cros_class.command_name
+      cmd_stats = stats.Stats.SafeInit(cmd_line=sys.argv, cmd_base=cmd_base)
+      if cmd_stats:
+        queue.put([cmd_stats, stats.StatsUploader.URL,
+                   subcommand.upload_stats_timeout])
+    # TODO: to make command completion faster, send an interrupt signal to the
+    # stats uploader task after the subcommand completes.
+    _RunSubCommand(subcommand)
+
   return 0

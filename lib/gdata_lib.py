@@ -201,6 +201,7 @@ class Issue(object):
     'status': None, # Current issue status (text) (e.g. Assigned)
     'summary': None,# Issue summary (first comment)
     'title': None,  # Title text
+    'ccs': [],      # Cc list
     }
 
   __slots__ = SlotDefaults.keys()
@@ -364,20 +365,25 @@ class TrackerComm(object):
                                          author=self.author,
                                          status=issue.status,
                                          owner=issue.owner,
-                                         labels=issue.labels)
+                                         labels=issue.labels,
+                                         ccs=issue.ccs)
       issue.id = int(created.id.text.split('/')[-1])
       return issue.id
     except gdata.client.RequestError as ex:
       if ex.body and ex.body.lower() == 'user not found':
         raise TrackerInvalidUserError('Tracker user %s not found' % issue.owner)
+      if ex.body and ex.body.lower() == 'issue owner must be a member':
+        raise TrackerInvalidUserError('Tracker user %s not a member' %
+                                      issue.owner)
       raise
 
-  def AppendTrackerIssueById(self, issue_id, comment):
+  def AppendTrackerIssueById(self, issue_id, comment, owner=None):
     """Append |comment| to issue |issue_id| in Tracker"""
     self.it_client.update_issue(project_name=self.project_name,
                                 issue_id=issue_id,
                                 author=self.author,
-                                comment=comment)
+                                comment=comment,
+                                owner=owner)
     return issue_id
 
 

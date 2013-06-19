@@ -6,6 +6,8 @@
 
 import os
 
+USE_GOB = False
+
 SOURCE_ROOT = os.path.dirname(os.path.abspath(__file__))
 SOURCE_ROOT = os.path.realpath(os.path.join(SOURCE_ROOT, '..', '..'))
 CROSUTILS_DIR = os.path.join(SOURCE_ROOT, 'src/scripts')
@@ -27,6 +29,23 @@ REEXEC_API_MAJOR = 0
 REEXEC_API_MINOR = 2
 REEXEC_API_VERSION = '%i.%i' % (REEXEC_API_MAJOR, REEXEC_API_MINOR)
 
+GOOGLE_EMAIL = '@google.com'
+CHROMIUM_EMAIL = '@chromium.org'
+
+CORP_DOMAIN = 'corp.google.com'
+GOLO_DOMAIN = 'golo.chromium.org'
+
+GOB_URL = 'https://%s.googlesource.com'
+GOB_REVIEW_URL = 'https://%s-review.googlesource.com'
+
+PUBLIC_GOB_HOST = 'chromium'
+PUBLIC_GOB_URL = GOB_URL % PUBLIC_GOB_HOST
+PUBLIC_GOB_REVIEW_URL = GOB_REVIEW_URL % PUBLIC_GOB_HOST
+
+INTERNAL_GOB_HOST = 'chrome-internal'
+INTERNAL_GOB_URL = GOB_URL % INTERNAL_GOB_HOST
+INTERNAL_GOB_REVIEW_URL = GOB_REVIEW_URL % INTERNAL_GOB_HOST
+
 GERRIT_PORT = '29418'
 GERRIT_INT_PORT = '29419'
 
@@ -34,11 +53,17 @@ GERRIT_HOST = 'gerrit.chromium.org'
 GERRIT_INT_HOST = 'gerrit-int.chromium.org'
 GIT_HOST = 'git.chromium.org'
 
-GERRIT_SSH_URL = 'ssh://%s:%s' % (GERRIT_HOST, GERRIT_PORT)
-GERRIT_INT_SSH_URL = 'ssh://%s:%s' % (GERRIT_INT_HOST, GERRIT_INT_PORT)
-GERRIT_HTTP_URL = 'https://%s' % GERRIT_HOST
-GIT_HTTP_URL = 'https://%s/git' % GIT_HOST
-CHROMIUM_GOOGLESOURCE_URL = 'https://chromium.googlesource.com/'
+# TODO(szager): Deprecate these variables in favor of (PUBLIC|INTERNAL)_GOB_*
+# once the migration to git-on-borg is complete.  Leaving them intact now to
+# make the transition easier.
+if USE_GOB:
+  GERRIT_SSH_URL = PUBLIC_GOB_URL
+  GERRIT_INT_SSH_URL = INTERNAL_GOB_URL
+  GIT_HTTP_URL = PUBLIC_GOB_URL
+else:
+  GERRIT_SSH_URL = 'ssh://%s:%s' % (GERRIT_HOST, GERRIT_PORT)
+  GERRIT_INT_SSH_URL = 'ssh://%s:%s' % (GERRIT_INT_HOST, GERRIT_INT_PORT)
+  GIT_HTTP_URL = 'http://%s/git' % GIT_HOST
 
 REPO_PROJECT = 'external/repo'
 REPO_URL = '%s/%s' % (GIT_HTTP_URL, REPO_PROJECT)
@@ -67,6 +92,7 @@ CROS_REMOTES = {
 # TODO(sosa): Move to manifest-versions-external once its created
 MANIFEST_VERSIONS_SUFFIX = '/chromiumos/manifest-versions'
 MANIFEST_VERSIONS_INT_SUFFIX = '/chromeos/manifest-versions'
+MANIFEST_VERSIONS_GS_URL = 'gs://chromeos-manifest-versions'
 
 PATCH_BRANCH = 'patch_branch'
 STABLE_EBUILD_BRANCH = 'stabilizing_branch'
@@ -94,6 +120,10 @@ USE_CHROME_INTERNAL = 'chrome_internal'
 USE_CHROME_PDF = 'chrome_pdf'
 USE_PGO_GENERATE = 'pgo_generate'
 USE_PGO_USE = 'pgo_use'
+
+# PGO-specific constants.
+PGO_GENERATE_DISK_LAYOUT = '2gb-rootfs-updatable'
+PGO_USE_TIMEOUT = 180 * 60
 
 # Builds and validates _alpha ebuilds.  These builds sync to the latest
 # revsion of the Chromium src tree and build with that checkout.
@@ -136,6 +166,9 @@ COMMIT_QUEUE_TYPE = 'commit-queue'
 # Hybrid Commit and PFQ type.  Ultimate protection.
 PALADIN_TYPE = 'paladin'
 
+# A builder that kicks off Pre-CQ builders that bless the purest CLs.
+PRE_CQ_LAUNCHER_TYPE = 'priest'
+
 # Chrome PFQ type.  Incremental build type that builds and validates new
 # versions of Chrome.  Only valid if set with CHROME_REV.  See
 # VALID_CHROME_REVISIONS for more information.
@@ -165,20 +198,25 @@ VALID_BUILD_TYPES = (
     CHROOT_BUILDER_BOARD,
     CHROME_PFQ_TYPE,
     PFQ_TYPE,
-    REFRESH_PACKAGES_TYPE
+    PRE_CQ_LAUNCHER_TYPE,
+    REFRESH_PACKAGES_TYPE,
 )
+
+# The name of the builder used to launch the pre-CQ.
+PRE_CQ_BUILDER_NAME = 'pre-cq-group'
 
 
 # Define pool of machines for Hardware tests.
 HWTEST_DEFAULT_NUM = 6
-HWTEST_TRYBOT_NUM = 1
+HWTEST_TRYBOT_NUM = 3
 HWTEST_MACH_POOL = 'bvt'
-HWTEST_PALADIN_POOL = 'cq-bvt'
+HWTEST_PALADIN_POOL = 'cq'
 HWTEST_CHROME_PFQ_POOL = 'chromepfq'
 HWTEST_CHROME_PERF_POOL = 'chromeperf'
 HWTEST_TRYBOT_POOL = 'try-bot'
 # Currently supported hwtest boards.
-HWTEST_BOARD_WHITELIST = ['mario', 'lumpy']
+HWTEST_BOARD_WHITELIST = ['x86-mario', 'lumpy', 'daisy']
+HWTEST_AU_SUITE = 'au'
 
 # Defines VM Test types.
 SMOKE_SUITE_TEST_TYPE = 'smoke_suite'
@@ -194,9 +232,12 @@ SDK_VERSION_FILE = os.path.join('src/third_party/coreos-overlay',
                                 'coreos/binhost/host/sdk_version.conf')
 SDK_GS_BUCKET = 'coreos-sdk'
 
+PUBLIC = 'public'
+PRIVATE = 'private'
+
 BOTH_OVERLAYS = 'both'
-PUBLIC_OVERLAYS = 'public'
-PRIVATE_OVERLAYS = 'private'
+PUBLIC_OVERLAYS = PUBLIC
+PRIVATE_OVERLAYS = PRIVATE
 VALID_OVERLAYS = [BOTH_OVERLAYS, PUBLIC_OVERLAYS, PRIVATE_OVERLAYS, None]
 
 # Common default logging settings for use with the logging module.
@@ -212,6 +253,10 @@ PATCH_TAGS = (INTERNAL_PATCH_TAG, EXTERNAL_PATCH_TAG)
 DEFAULT_CQ_READY_QUERY = ('status:open AND CodeReview=+2 AND Verified=+1 '
                           'AND CommitQueue=+1 '
                           'AND NOT ( CodeReview=-2 OR Verified=-1 )')
+
+# Default filter rules for verifying that Gerrit returned results that matched
+# our query. This used for working around Gerrit bugs.
+DEFAULT_CQ_READY_FIELDS = {'SUBM': '0', 'CRVW': '2', 'VRIF': '1', 'COMR': '1'}
 
 # Some files need permissions set for several distinct groups. A google storage
 # acl (xml) file will be necessary in those cases. Make available well known
@@ -251,8 +296,8 @@ CHROOT_ENVIRONMENT_WHITELIST = (
 
 # Paths for Chrome LKGM which are relative to the Chromium base url.
 CHROME_LKGM_FILE = 'CHROMEOS_LKGM'
-PATH_TO_CHROME_LKGM = 'src/chromeos/%s' % CHROME_LKGM_FILE
-SVN_CHROME_LKGM = 'trunk/%s' % PATH_TO_CHROME_LKGM
+PATH_TO_CHROME_LKGM = 'chromeos/%s' % CHROME_LKGM_FILE
+SVN_CHROME_LKGM = 'trunk/src/%s' % PATH_TO_CHROME_LKGM
 
 # Cache constants.
 COMMON_CACHE = 'common'
@@ -277,3 +322,15 @@ CHROMITE_CONFIG_DIR = os.path.expanduser('~/.chromite')
 CHROME_SDK_BASHRC = os.path.join(CHROMITE_CONFIG_DIR, 'chrome_sdk.bashrc')
 SYNC_RETRIES = 2
 SLEEP_TIMEOUT = 30
+
+# Lab status url.
+LAB_STATUS_URL = 'http://chromiumos-lab.appspot.com/current?format=json'
+
+# URLs to the various waterfalls.
+BUILD_DASHBOARD = 'http://build.chromium.org/p/chromiumos'
+BUILD_INT_DASHBOARD = 'https://uberchromegw.corp.google.com/i/chromeos'
+TRYBOT_DASHBOARD = 'https://uberchromegw.corp.google.com/i/chromiumos.tryserver'
+
+# Email validation regex. Not quite fully compliant with RFC 2822, but good
+# approximation.
+EMAIL_REGEX = r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,4}'

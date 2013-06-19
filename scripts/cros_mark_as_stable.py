@@ -18,6 +18,9 @@ from chromite.lib import osutils
 from chromite.lib import parallel
 
 
+# Commit message for uprevving Portage packages.
+_GIT_COMMIT_MESSAGE = 'Marking 9999 ebuild for %s as stable.'
+
 # Dictionary of valid commands with usage information.
 COMMAND_DICTIONARY = {
                         'commit':
@@ -34,7 +37,7 @@ def CleanStalePackages(boards, package_atoms):
   """Cleans up stale package info from a previous build.
   Args:
     boards: Boards to clean the packages from.
-    package_atoms: The actual package atom to unmerge.
+    package_atoms: A list of package atoms to unmerge.
   """
   if package_atoms:
     cros_build_lib.Info('Cleaning up stale packages %s.' % package_atoms)
@@ -50,11 +53,15 @@ def CleanStalePackages(boards, package_atoms):
       suffix = ''
       runcmd = cros_build_lib.SudoRunCommand
 
-    if package_atoms:
-      runcmd(['emerge' + suffix, '-q', '--unmerge'] + package_atoms,
-             extra_env={'CLEAN_DELAY': '0'})
-    runcmd(['eclean' + suffix, '-d', 'packages'],
-           redirect_stdout=True, redirect_stderr=True)
+    emerge, eclean = 'emerge' + suffix, 'eclean' + suffix
+    if not osutils.FindMissingBinaries([emerge, eclean]):
+      # If nothing was found to be unmerged, emerge will exit(1).
+      result = runcmd([emerge, '-q', '--unmerge'] + package_atoms,
+                      extra_env={'CLEAN_DELAY': '0'}, error_code_ok=True)
+      if not result.returncode in (0, 1):
+        raise cros_build_lib.RunCommandError('unexpected error', result)
+      runcmd([eclean, '-d', 'packages'],
+             redirect_stdout=True, redirect_stderr=True)
 
   tasks = []
   for board in boards:
@@ -229,11 +236,10 @@ def main(_argv):
       '%s/third_party/coreos-overlay' % options.srcroot: []
     }
 
-  if command == 'commit':
-    portage_utilities.BuildEBuildDictionary(
-      overlays, options.all, package_list)
-
   manifest = git.ManifestCheckout.Cached(options.srcroot)
+
+  if command == 'commit':
+    portage_utilities.BuildEBuildDictionary(overlays, options.all, package_list)
 
   # Contains the array of packages we actually revved.
   revved_packages = []
@@ -291,19 +297,24 @@ def main(_argv):
           cros_build_lib.RunCommand(['git', 'rebase', existing_branch],
                                     print_cmd=False, cwd=overlay)
 
+        messages = []
         for ebuild in ebuilds:
           if options.verbose:
             cros_build_lib.Info('Working on %s', ebuild.package)
           try:
-            new_package = ebuild.RevWorkOnEBuild(options.srcroot)
+            new_package = ebuild.RevWorkOnEBuild(options.srcroot, manifest)
             if new_package:
               revved_packages.append(ebuild.package)
               new_package_atoms.append('=%s' % new_package)
+              messages.append(_GIT_COMMIT_MESSAGE % ebuild.package)
           except (OSError, IOError):
             cros_build_lib.Warning('Cannot rev %s\n' % ebuild.package +
                     'Note you will have to go into %s '
                     'and reset the git repo yourself.' % overlay)
             raise
+
+        if messages:
+          portage_utilities.EBuild.CommitChange('\n\n'.join(messages), overlay)
 
         if cros_build_lib.IsInsideChroot():
           # Regenerate caches if need be.  We do this all the time to

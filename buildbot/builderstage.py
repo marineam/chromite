@@ -4,6 +4,7 @@
 
 """Module containing the base class for the stages that a builder runs."""
 
+import copy
 import os
 import re
 import sys
@@ -20,12 +21,13 @@ except ImportError:
 from chromite.buildbot import cbuildbot_config
 from chromite.buildbot import cbuildbot_results as results_lib
 from chromite.buildbot import portage_utilities
+from chromite.buildbot import validation_pool
 from chromite.lib import cros_build_lib
 
 
 class BuilderStage(object):
   """Parent class for stages to be performed by a builder."""
-  name_stage_re = re.compile('(\w+)Stage')
+  name_stage_re = re.compile(r'(\w+)Stage')
 
   # TODO(sosa): Remove these once we have a SEND/RECIEVE IPC mechanism
   # implemented.
@@ -57,7 +59,7 @@ class BuilderStage(object):
     if not self._options.archive_base and self._options.remote_trybot:
       self._bot_id = 'trybot-' + self._bot_id
 
-    self._build_config = build_config
+    self._build_config = copy.deepcopy(build_config)
     self.name = self.StageNamePrefix()
     if suffix:
       self.name += suffix
@@ -71,6 +73,20 @@ class BuilderStage(object):
     self._chrome_rev = self._build_config['chrome_rev']
     if self._options.chrome_rev:
       self._chrome_rev = self._options.chrome_rev
+
+  def ConstructDashboardURL(self, stage=None):
+    """Return the dashboard URL
+
+    This is the direct link to buildbot logs as seen in build.chromium.org
+
+    Args:
+      stage: Link to a specific |stage|, otherwise the general buildbot log
+    Returns:
+      The fully formed URL
+    """
+    return validation_pool.ValidationPool.ConstructDashboardURL(
+        self._build_config['overlays'], self._options.remote_trybot,
+        self._build_config['name'], self._options.buildnumber, stage=stage)
 
   def _ExtractOverlays(self):
     """Extracts list of overlays into class."""
@@ -133,51 +149,26 @@ class BuilderStage(object):
         enter_chroot=True, error_code_ok=True)
     return binhost.output.rstrip('\n')
 
-  # pylint: disable=W0102
-  def _GetSlavesForMaster(self, configs=cbuildbot_config.config):
-    """Gets the important builds corresponding to this master builder.
-
-    Given that we are a master builder, find all corresponding slaves that
-    are important to me.  These are those builders that share the same
-    build_type and manifest_version url.
-
-    If we have overridden our chrome_rev type, do not presume to be the
-    master of either our set of builders or the other's.
-    """
-    if self._chrome_rev !=  self._build_config['chrome_rev']:
-      return []
-    return cbuildbot_config.GetSlavesForMaster(self._build_config, configs)
-
-  # pylint: disable=W0102
-  def _GetSlavesForUnifiedMaster(self, configs=cbuildbot_config.config):
-    """Gets the important builds corresponding to this unified master.
-
-    A unified master has both private and public slaves that read from two
-    separate manifest_versions repositories.
+  @staticmethod
+  def _GetSlavesForMaster(build_config, configs=None):
+    """Gets the important builds corresponding to this master.
 
     Returns:
-      A tuple consisting of the public slaves and private slaves for this
-      unified builder.
+      A list of the slaves for this builder.
     """
-    public_builders = []
-    private_builders = []
-    build_type = self._build_config['build_type']
-    branch_config = self._build_config['branch']
-    assert self._build_config['unified_manifest_version']
-    assert self._build_config['manifest_version']
-    assert self._build_config['master']
-    for build_name, config in configs.iteritems():
-      if (config['important'] and config['unified_manifest_version'] and
+    if configs is None:
+      configs = cbuildbot_config.config
+    builders = []
+    assert build_config['manifest_version']
+    assert build_config['master']
+    for config in configs.itervalues():
+      if (config['important'] and
           config['manifest_version'] and
-          config['build_type'] == build_type and
-          config['chrome_rev'] == self._chrome_rev and
-          config['branch'] == branch_config):
-        if config['internal']:
-          private_builders.append(build_name)
-        else:
-          public_builders.append(build_name)
-
-    return public_builders, private_builders
+          config['build_type'] == build_config['build_type'] and
+          config['chrome_rev'] == build_config['chrome_rev'] and
+          config['branch'] == build_config['branch']):
+        builders.append(config)
+    return builders
 
   def _Begin(self):
     """Can be overridden.  Called before a stage is performed."""
@@ -193,11 +184,10 @@ class BuilderStage(object):
     self._PrintLoudly('Finished Stage %s - %s' %
                       (self.name, time.strftime('%H:%M:%S')))
 
-  def _PerformStage(self):
+  def PerformStage(self):
     """Subclassed stages must override this function to perform what they want
     to be done.
     """
-    pass
 
   def _HandleExceptionAsSuccess(self, _exception):
     """Use instead of HandleStageException to ignore an exception."""
@@ -225,7 +215,7 @@ class BuilderStage(object):
     return results_lib.Results.FORGIVEN, None
 
   def _HandleStageException(self, exception):
-    """Called when _PerformStages throws an exception.  Can be overriden.
+    """Called when PerformStage throws an exception.  Can be overriden.
 
     Should return result, description.  Description should be None if result
     is not an exception.
@@ -246,11 +236,14 @@ class BuilderStage(object):
         self.config_name and not self._build_config[self.config_name]):
       self._PrintLoudly('Not running Stage %s' % self.name)
       self.HandleSkip()
+      results_lib.Results.Record(self.name, results_lib.Results.SKIPPED)
       return
 
     record = results_lib.Results.PreviouslyCompletedRecord(self.name)
     if record:
-      self._PrintLoudly('Skipping Stage %s' % self.name)
+      # Success is stored in the results log for a stage that completed
+      # successfully in a previous run.
+      self._PrintLoudly('Stage %s processed previously' % self.name)
       self.HandleSkip()
       results_lib.Results.Record(self.name, results_lib.Results.SUCCESS, None,
                                  float(record[2]))
@@ -266,7 +259,7 @@ class BuilderStage(object):
     sys.stderr.flush()
     self._Begin()
     try:
-      self._PerformStage()
+      self.PerformStage()
     except SystemExit as e:
       if e.code != 0:
         result, description = self._HandleStageException(e)
@@ -279,6 +272,9 @@ class BuilderStage(object):
       if result not in (results_lib.Results.FORGIVEN,
                         results_lib.Results.SUCCESS):
         raise results_lib.StepFailure()
+    except BaseException as e:
+      result, description = self._HandleStageException(e)
+      raise
     finally:
       elapsed_time = time.time() - start_time
       results_lib.Results.Record(self.name, result, description,

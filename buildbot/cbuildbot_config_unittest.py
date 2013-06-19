@@ -8,21 +8,19 @@
 
 import json
 import os
-import re
 import subprocess
 import sys
-import urllib
 
 import constants
 sys.path.insert(0, constants.SOURCE_ROOT)
+from chromite.buildbot import builderstage
 from chromite.buildbot import cbuildbot_config
 from chromite.lib import cros_test_lib
 from chromite.lib import git
+from chromite.lib import parallel
 
-CHROMIUM_WATCHING_URL = ("http://src.chromium.org/viewvc/" +
-    "chrome/trunk/tools/build/masters/" +
-    "master.chromium.chromiumos" + "/" +
-    "master_chromiumos_cros_cfg.py")
+CHROMIUM_WATCHING_URL = ('http://src.chromium.org/chrome/trunk/tools/build/'
+    'masters/master.chromium.chromiumos/master_chromiumos_cros_cfg.py')
 
 # pylint: disable=W0212,R0904
 class CBuildBotTest(cros_test_lib.MoxTestCase):
@@ -71,8 +69,8 @@ class CBuildBotTest(cros_test_lib.MoxTestCase):
                       "Config %s doesn't have a list of boards." % build_name)
       self.assertEqual(len(set(config['boards'])), len(config['boards']),
                        'Config %s has duplicate boards.' % build_name)
-      self.assertTrue(config['boards'],
-                      'Config %s has at least one board.' % build_name)
+      self.assertTrue(config['boards'] is not None,
+                      'Config %s defines a list of boards.' % build_name)
 
   def testOverlaySettings(self):
     """Verify overlays and push_overlays have legal values."""
@@ -108,7 +106,7 @@ class CBuildBotTest(cros_test_lib.MoxTestCase):
       overlays = config['overlays']
       push_overlays = config['push_overlays']
       if (overlays and push_overlays and config['uprev'] and config['master']
-          and not config['branch'] and not config['unified_manifest_version']):
+          and not config['branch']):
         other_master = masters.get(push_overlays)
         err_msg = 'Found two masters for push_overlays=%s: %s and %s'
         self.assertFalse(other_master,
@@ -172,31 +170,6 @@ class CBuildBotTest(cros_test_lib.MoxTestCase):
         self.assertTrue(config['vm_tests'] is None,
                         "ARM builder %s can't run vm tests!" % build_name)
 
-  def testImportantMattersToChrome(self):
-    # TODO(ferringb): Decorate this as a network test.
-    namefinder = re.compile(r" *params='([^' ]*)[ ']")
-    req = urllib.urlopen(CHROMIUM_WATCHING_URL)
-    watched_configs = []
-    for m in [namefinder.match(line) for line in req.read().splitlines()]:
-      if m:
-        watched_configs.append(m.group(1))
-
-    watched_boards = []
-    for config in watched_configs:
-      watched_boards.extend(cbuildbot_config.config[config]['boards'])
-
-    watched_boards = set(watched_boards)
-
-    for build_name, config in cbuildbot_config.config.iteritems():
-      if (config['important'] and
-          config['chrome_rev'] == constants.CHROME_REV_LATEST and
-          config['overlays'] == constants.PUBLIC_OVERLAYS and
-          config['build_type'] == constants.CHROME_PFQ_TYPE):
-        boards = set(config['boards'])
-        self.assertTrue(boards.issubset(watched_boards),
-                        'Config %s: boards %r are not watched on Chromium' %
-                        (build_name, list(boards - watched_boards)))
-
   #TODO: Add test for compare functionality
   def testJSONDumpLoadable(self):
     """Make sure config export functionality works."""
@@ -228,23 +201,41 @@ class CBuildBotTest(cros_test_lib.MoxTestCase):
             "%s is trying to run hw tests without uploading payloads." %
             build_name)
 
+  def testHWTestTimeout(self):
+    """Verify that hw test timeout is in a reasonable range."""
+    # The parallel library will kill the process if it's silent for longer
+    # than the silent timeout.
+    max_timeout = parallel._BackgroundTask.MINIMUM_SILENT_TIMEOUT
+    for build_name, config in cbuildbot_config.config.iteritems():
+      for test_config in config['hw_tests']:
+        self.assertTrue(test_config.timeout < max_timeout,
+            '%s has a hw_tests_timeout that is too large.' % build_name)
+
   def testValidUnifiedMasterConfig(self):
     """Make sure any unified master configurations are valid."""
     for build_name, config in cbuildbot_config.config.iteritems():
       error = 'Unified config for %s has invalid values' % build_name
       # Unified masters must be internal and must rev both overlays.
-      if config['unified_manifest_version'] and config['master']:
+      if config['master']:
         self.assertTrue(
             config['internal'] and config['manifest_version'], error)
-        self.assertEqual(config['overlays'], constants.BOTH_OVERLAYS)
-      elif config['unified_manifest_version'] and not config['master']:
+      elif not config['master'] and config['manifest_version']:
         # Unified slaves can rev either public or both depending on whether
         # they are internal or not.
-        self.assertTrue(config['manifest_version'], error)
-        if config['internal']:
-          self.assertEqual(config['overlays'], constants.BOTH_OVERLAYS, error)
-        else:
+        if not config['internal']:
           self.assertEqual(config['overlays'], constants.PUBLIC_OVERLAYS, error)
+        elif cbuildbot_config.IsCQType(config['build_type']):
+          self.assertEqual(config['overlays'], constants.BOTH_OVERLAYS, error)
+
+  def testGetSlaves(self):
+    """Make sure every master has a sane list of slaves"""
+    for build_name, config in cbuildbot_config.config.iteritems():
+      if config['master']:
+        configs = builderstage.BuilderStage._GetSlavesForMaster(config)
+        self.assertEqual(
+            len(map(repr, configs)), len(set(map(repr, configs))),
+            'Duplicate board in slaves of %s will cause upload prebuilts'
+            ' failures' % build_name)
 
   def testFactoryFirmwareValidity(self):
     """Ensures that firmware/factory branches have at least 1 valid name."""
@@ -349,16 +340,6 @@ class CBuildBotTest(cros_test_lib.MoxTestCase):
           '%s did not match any types in %s' %
           (config_name, 'cbuildbot_config.CONFIG_TYPE_DUMP_ORDER'))
 
-  def testGetSlaves(self):
-    """Make sure every master has a sane list of slaves"""
-    for build_name, config in cbuildbot_config.config.iteritems():
-      if config['master'] and not config['unified_manifest_version']:
-        slaves = cbuildbot_config.GetSlavesForMaster(config)
-        self.assertEqual(
-            len(slaves), len(set(slaves)),
-            'Duplicate board in slaves of %s will cause upload prebuilts'
-            ' failures' % build_name)
-
   def testCantBeBothTypesOfLKGM(self):
     """Using lkgm and chrome_lkgm doesn't make sense."""
     for config in cbuildbot_config.config.values():
@@ -371,6 +352,25 @@ class CBuildBotTest(cros_test_lib.MoxTestCase):
                        config['important'] and not config['quick_unit'] and
                        config['vm_tests'], '%s has both quick_unit=False and '
                        'vm_tests' % build_name)
+
+  def testCantBeBothTypesOfPGO(self):
+    """Using pgo_generate and pgo_use together doesn't work."""
+    for config in cbuildbot_config.config.values():
+      self.assertFalse(config['pgo_use'] and config['pgo_generate'])
+
+  def testValidPrebuilts(self):
+    """Verify all builders have valid prebuilt values."""
+    for build_name, config in cbuildbot_config.config.iteritems():
+      msg = 'Config %s: has unexpected prebuilts value.' % build_name
+      valid_values = (False, constants.PRIVATE, constants.PUBLIC)
+      self.assertTrue(config['prebuilts'] in valid_values, msg)
+
+  def testInternalPrebuilts(self):
+    for build_name, config in cbuildbot_config.config.iteritems():
+      if (config['internal'] and
+          config['build_type'] != constants.CHROME_PFQ_TYPE):
+        msg = 'Config %s is internal but has public prebuilts.' % build_name
+        self.assertNotEqual(config['prebuilts'], constants.PUBLIC, msg)
 
 
 class FindFullTest(cros_test_lib.TestCase):
@@ -416,6 +416,31 @@ class FindFullTest(cros_test_lib.TestCase):
   def testPGOCanonicalResolution(self):
     """Test prefer non-PGO over PGO builder."""
     self._CheckCanonicalConfig('lumpy', 'release')
+
+  def testOneFullConfigPerBoard(self):
+    """There is at most one 'full' config for a board."""
+    # Verifies that there is one external 'full' and one internal 'release'
+    # build per board.  This is to ensure that we fail any new configs that
+    # wrongly have names like *-bla-release or *-bla-full. This case can also
+    # be caught if the new suffix was added to
+    # cbuildbot_config.CONFIG_TYPE_DUMP_ORDER
+    # (see testNonOverlappingConfigTypes), but that's not guaranteed to happen.
+    def AtMostOneConfig(board, label, configs):
+      if len(configs) > 1:
+        self.fail(
+            'Found more than one %s config for %s: %r'
+            % (label, board, [c['name'] for c in configs]))
+
+    boards = set()
+    for config in cbuildbot_config.config.itervalues():
+      boards.update(config['boards'])
+    # Sanity check of the boards.
+    assert boards
+
+    for b in boards:
+      external, internal = cbuildbot_config.FindFullConfigsForBoard(b)
+      AtMostOneConfig(b, 'external', external)
+      AtMostOneConfig(b, 'internal', internal)
 
 
 if __name__ == '__main__':

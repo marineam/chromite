@@ -10,6 +10,7 @@ Used by Chromium OS buildbot configuration for all Chromium OS builds including
 full and pre-flight-queue builds.
 """
 
+import collections
 import distutils.version
 import errno
 import glob
@@ -19,6 +20,7 @@ import os
 import pprint
 import sys
 import time
+import traceback
 
 from chromite.buildbot import builderstage as bs
 from chromite.buildbot import cbuildbot_config
@@ -42,8 +44,6 @@ from chromite.lib import patch as cros_patch
 from chromite.lib import parallel
 from chromite.lib import sudo
 
-
-cros_build_lib.STRICT_SUDO = True
 
 _DEFAULT_LOG_DIR = 'cbuildbot_logs'
 _BUILDBOT_LOG_FILE = 'cbuildbot.log'
@@ -136,10 +136,9 @@ class Builder(object):
   use is builder_instance.Run().
 
   Vars:
-    build_config:  The configuration dictionary from cbuildbot_config.
-    options:  The options provided from optparse in main().
-    archive_urls:  Where our artifacts for this builder will be archived.
-    release_tag:  The associated "chrome os version" of this build.
+    build_config: The configuration dictionary from cbuildbot_config.
+    options: The options provided from optparse in main().
+    release_tag: The associated "chrome os version" of this build.
   """
 
   def __init__(self, options, build_config):
@@ -147,12 +146,10 @@ class Builder(object):
     self.build_config = build_config
     self.options = options
 
-    # TODO, Remove here and in config after bug chromium-os:14649 is fixed.
     if self.build_config['chromeos_official']:
       os.environ['CHROMEOS_OFFICIAL'] = '1'
 
     self.archive_stages = {}
-    self.archive_urls = {}
     self.release_tag = None
     self.patch_pool = trybot_patch_pool.TrybotPatchPool()
 
@@ -233,9 +230,11 @@ class Builder(object):
       ver = stages.ManifestVersionedSyncStage.manifest_manager.current_version
       args += ['--version', ver]
 
-    if isinstance(sync_instance, stages.CommitQueueSyncStage):
-      vp_file = sync_instance.SaveValidationPool()
-      args += ['--validation_pool', vp_file]
+    pool = getattr(sync_instance, 'pool', None)
+    if pool:
+      filename = os.path.join(self.options.buildroot, 'validation_pool.dump')
+      pool.Save(filename)
+      args += ['--validation_pool', filename]
 
     # Reset the cache dir so that the child will calculate it automatically.
     if not self.options.cache_dir_specified:
@@ -310,21 +309,20 @@ class Builder(object):
         success = self._ReExecuteInBuildroot(sync_instance)
       else:
         self.RunStages()
-    except results_lib.StepFailure:
-      # StepFailure exceptions are already recorded in the report, so there
-      # is no need to print these tracebacks twice.
+    except Exception as ex:
+      # If the build is marked as successful, but threw exceptions, that's a
+      # problem.
       exception_thrown = True
-      if not print_report:
+      if results_lib.Results.BuildSucceededSoFar():
+        traceback.print_exc(file=sys.stdout)
         raise
-    except Exception:
-      exception_thrown = True
-      raise
+      if not (print_report and isinstance(ex, results_lib.StepFailure)):
+        raise
     finally:
       if print_report:
         results_lib.WriteCheckpoint(self.options.buildroot)
-        print '\n\n\n@@@BUILD_STEP Report@@@\n'
-        results_lib.Results.Report(sys.stdout, self.archive_urls,
-                                   self.release_tag)
+        self._RunStage(stages.ReportStage, self.archive_stages,
+                       self.release_tag)
         success = results_lib.Results.BuildSucceededSoFar()
         if exception_thrown and success:
           success = False
@@ -334,6 +332,9 @@ Exception thrown, but all stages marked successful. This is an internal error,
 because the stage that threw the exception should be marked as failing."""
 
     return success
+
+
+BoardConfig = collections.namedtuple('BoardConfig', ['board', 'name'])
 
 
 class SimpleBuilder(Builder):
@@ -353,11 +354,32 @@ class SimpleBuilder(Builder):
 
     return sync_stage
 
-  def _RunBackgroundStagesForBoard(self, board):
+  @staticmethod
+  def _RunParallelStages(stage_objs):
+    """Run the specified stages in parallel."""
+    steps = [stage.Run for stage in stage_objs]
+    try:
+      parallel.RunParallelSteps(steps)
+    except BaseException as ex:
+      # If a stage threw an exception, it might not have correctly reported
+      # results (e.g. because it was killed before it could report the
+      # results.) In this case, attribute the exception to any stages that
+      # didn't report back correctly (if any).
+      for stage in stage_objs:
+        if not results_lib.Results.StageHasResults(stage.name):
+          results_lib.Results.Record(stage.name, ex, str(ex))
+      raise
+
+  def _RunBackgroundStagesForBoard(self, config, board, compilecheck):
     """Run background board-specific stages for the specified board."""
-    archive_stage = self.archive_stages[board]
-    configs = self.build_config['board_specific_configs']
-    config = configs.get(board, self.build_config)
+    archive_stage = self.archive_stages[BoardConfig(board, config['name'])]
+    if config['pgo_generate']:
+      return
+    if compilecheck:
+      self._RunStage(stages.BuildPackagesStage, board, archive_stage,
+                     config=config)
+      self._RunStage(stages.UnitTestStage, board, config=config)
+      return
     stage_list = [[stages.VMTestStage, board, archive_stage],
                   [stages.SignerTestStage, board, archive_stage],
                   [stages.UnitTestStage, board],
@@ -366,22 +388,29 @@ class SimpleBuilder(Builder):
 
     # We can not run hw tests without archiving the payloads.
     if self.options.archive:
-      for suite in config['hw_tests']:
-        stage_list.append([stages.HWTestStage, board, archive_stage, suite])
+      for suite_config in config['hw_tests']:
+        if suite_config.async:
+          stage_list.append([stages.ASyncHWTestStage, board, archive_stage,
+                             suite_config])
+        elif suite_config.suite == constants.HWTEST_AU_SUITE:
+          stage_list.append([stages.AUTestStage, board, archive_stage,
+                             suite_config])
+        else:
+          stage_list.append([stages.HWTestStage, board, archive_stage,
+                             suite_config])
 
-      for suite in config['async_hw_tests']:
-        stage_list.append([stages.ASyncHWTestStage, board, archive_stage,
-                           suite])
-
-    steps = [self._GetStageInstance(*x, config=config).Run for x in stage_list]
-    parallel.RunParallelSteps(steps + [archive_stage.Run])
+    stage_objs = [self._GetStageInstance(*x, config=config) for x in stage_list]
+    self._RunParallelStages(stage_objs + [archive_stage])
 
   def RunStages(self):
     """Runs through build process."""
     # TODO(sosa): Split these out into classes.
-    if self.build_config['build_type'] == constants.CHROOT_BUILDER_TYPE:
+    if self.build_config['build_type'] == constants.PRE_CQ_LAUNCHER_TYPE:
+      self._RunStage(stages.PreCQLauncherStage)
+    elif self.build_config['build_type'] == constants.CHROOT_BUILDER_TYPE:
       self._RunStage(stages.UprevStage, boards=[], enter_chroot=False)
-      self._RunStage(stages.BuildBoardStage, [constants.CHROOT_BUILDER_BOARD])
+      self._RunStage(stages.InitSDKStage)
+      self._RunStage(stages.SetupBoardStage, [constants.CHROOT_BUILDER_BOARD])
       self._RunStage(stages.SyncChromeStage)
       self._RunStage(stages.PatchChromeStage)
       self._RunStage(stages.SDKPackageStage)
@@ -389,35 +418,53 @@ class SimpleBuilder(Builder):
       self._RunStage(stages.UploadPrebuiltsStage,
                      constants.CHROOT_BUILDER_BOARD, None)
     elif self.build_config['build_type'] == constants.REFRESH_PACKAGES_TYPE:
-      self._RunStage(stages.BuildBoardStage)
+      self._RunStage(stages.InitSDKStage)
+      self._RunStage(stages.SetupBoardStage)
       self._RunStage(stages.RefreshPackageStatusStage)
     else:
-      self._RunStage(stages.BuildBoardStage)
+      self._RunStage(stages.InitSDKStage)
       self._RunStage(stages.UprevStage)
-      self._RunStage(stages.SyncChromeStage)
+      self._RunStage(stages.SetupBoardStage)
+      # We need a handle to this stage to extract info from it.
+      sync_chrome_stage = self._GetStageInstance(stages.SyncChromeStage)
+      sync_chrome_stage.Run()
       self._RunStage(stages.PatchChromeStage)
 
-      configs = self.build_config['board_specific_configs']
-      for board in self.build_config['boards']:
-        config = configs.get(board, self.build_config)
-        archive_stage = self._GetStageInstance(stages.ArchiveStage, board,
-                                               config=config)
-        self.archive_stages[board] = archive_stage
+      configs = self.build_config['child_configs'] or [self.build_config]
+      tasks = []
+      for config in configs:
+        for board in config['boards']:
+          archive_stage = self._GetStageInstance(
+              stages.ArchiveStage, board, self.release_tag, config=config,
+              chrome_version=sync_chrome_stage.chrome_version)
+          board_config = BoardConfig(board, config['name'])
+          self.archive_stages[board_config] = archive_stage
+          tasks.append((config, board, archive_stage))
 
       # Set up a process pool to run test/archive stages in the background.
       # This process runs task(board) for each board added to the queue.
       task = self._RunBackgroundStagesForBoard
       with parallel.BackgroundTaskRunner(task) as queue:
-        for board in self.build_config['boards']:
-          # Run BuildTarget in the foreground.
-          archive_stage = self.archive_stages[board]
-          config = configs.get(board, self.build_config)
-          self._RunStage(stages.BuildTargetStage, board, archive_stage,
-                         self.release_tag, config=config)
-          self.archive_urls[board] = archive_stage.GetDownloadUrl()
+        for config, board, archive_stage in tasks:
+          compilecheck = config['compilecheck'] or self.options.compilecheck
+          if not compilecheck:
+            # Run BuildPackages and BuildImage in the foreground, generating
+            # or using PGO data if requested.
+            kwargs = {'archive_stage': archive_stage, 'config': config}
+            if config['pgo_generate']:
+              kwargs['pgo_generate'] = True
+            elif config['pgo_use']:
+              kwargs['pgo_use'] = True
+            self._RunStage(stages.BuildPackagesStage, board, **kwargs)
+            self._RunStage(stages.BuildImageStage, board, **kwargs)
 
-          # Kick off task(board) in the background.
-          queue.put([board])
+            if config['pgo_generate']:
+              suite = cbuildbot_config.PGORecordTest()
+              self._RunStage(stages.HWTestStage, board, archive_stage, suite,
+                             config=config)
+
+          # Kick off our background stages.
+          queue.put([config, board, compilecheck])
 
 
 class DistributedBuilder(SimpleBuilder):
@@ -435,6 +482,7 @@ class DistributedBuilder(SimpleBuilder):
     """
     super(DistributedBuilder, self).__init__(*args, **kwargs)
     self.completion_stage_class = None
+    self.sync_stage = None
 
   def GetSyncInstance(self):
     """Syncs the tree using one of the distributed sync logic paths.
@@ -443,7 +491,12 @@ class DistributedBuilder(SimpleBuilder):
     """
     # Determine sync class to use.  CQ overrides PFQ bits so should check it
     # first.
-    if cbuildbot_config.IsCQType(self.build_config['build_type']):
+    if self.build_config['pre_cq'] or self.options.pre_cq:
+      sync_stage = self._GetStageInstance(stages.PreCQSyncStage,
+                                          self.patch_pool.gerrit_patches)
+      self.completion_stage_class = stages.PreCQCompletionStage
+      self.patch_pool.gerrit_patches = []
+    elif cbuildbot_config.IsCQType(self.build_config['build_type']):
       sync_stage = self._GetStageInstance(stages.CommitQueueSyncStage)
       self.completion_stage_class = stages.CommitQueueCompletionStage
     elif cbuildbot_config.IsPFQType(self.build_config['build_type']):
@@ -453,15 +506,18 @@ class DistributedBuilder(SimpleBuilder):
       sync_stage = self._GetStageInstance(stages.ManifestVersionedSyncStage)
       self.completion_stage_class = stages.ManifestVersionedSyncCompletionStage
 
-    return sync_stage
+    self.sync_stage = sync_stage
+    return self.sync_stage
 
   def Publish(self, was_build_successful):
     """Completes build by publishing any required information."""
     completion_stage = self._GetStageInstance(self.completion_stage_class,
+                                              self.sync_stage,
                                               was_build_successful)
     completion_stage.Run()
     name = completion_stage.name
-    if not results_lib.Results.WasStageSuccessful(name):
+    if (self.build_config['pre_cq'] or self.options.pre_cq or
+        not results_lib.Results.WasStageSuccessful(name)):
       should_publish_changes = False
     else:
       should_publish_changes = (self.build_config['master'] and
@@ -550,7 +606,7 @@ def _DisableYamaHardLinkChecks():
     return
 
   # Create a hardlink in a tempdir and see if we get back EPERM.
-  with osutils.TempDirContextManager() as tempdir:
+  with osutils.TempDir() as tempdir:
     try:
       os.link('/bin/sh', os.path.join(tempdir, 'sh'))
     except OSError as e:
@@ -583,7 +639,9 @@ def _RunBuildStagesWrapper(options, build_config):
   """Helper function that wraps RunBuildStages()."""
   def IsDistributedBuilder():
     """Determines whether the build_config should be a DistributedBuilder."""
-    if not options.buildbot:
+    if build_config['pre_cq'] or options.pre_cq:
+      return True
+    elif not options.buildbot:
       return False
     elif build_config['build_type'] in _DISTRIBUTED_TYPES:
       # We don't do distributed logic to TOT Chrome PFQ's, nor local
@@ -611,8 +669,7 @@ def _RunBuildStagesWrapper(options, build_config):
   if build_config['sync_chrome'] is None:
     options.managed_chrome = (chrome_rev != constants.CHROME_REV_LOCAL and
         (not build_config['usepkg_build_packages'] or chrome_rev or
-         build_config['useflags'] or build_config['profile'] or
-         options.rietveld_patches))
+         build_config['profile'] or options.rietveld_patches))
   else:
     options.managed_chrome = build_config['sync_chrome']
 
@@ -758,12 +815,18 @@ def _CreateParser():
   parser = CustomParser(usage=usage, caching=FindCacheDir)
 
   # Main options
-  # The remote_pass_through parameter to add_option is implemented by the
-  # CustomOption class.  See CustomOption for more information.
+  parser.add_option('-l', '--list', action='store_true', dest='list',
+                    default=False,
+                    help='List the suggested trybot configs to use (see --all)')
   parser.add_option('-a', '--all', action='store_true', dest='print_all',
                     default=False,
-                    help=('List all of the buildbot configs available. Use '
-                          'with the --list option'))
+                    help='List all of the buildbot configs available w/--list')
+
+  parser.add_option('--local', default=False, action='store_true',
+                    help='Specifies that this tryjob should be run locally')
+  parser.add_option('--remote', default=False, action='store_true',
+                    help='Specifies that this tryjob should be run remotely')
+
   parser.add_remote_option('-b', '--branch',
                            help='The manifest branch to test.  The branch to '
                                 'check the buildroot out to.')
@@ -777,42 +840,66 @@ def _CreateParser():
                            callback=_CheckChromeRevOption,
                            help=('Revision of Chrome to use, of type [%s]'
                                  % '|'.join(constants.VALID_CHROME_REVISIONS)))
-  parser.add_remote_option('-g', '--gerrit-patches', action='extend',
-                           default=[], type='string',
-                           metavar="'Id1 *int_Id2...IdN'",
-                           help=("Space-separated list of short-form Gerrit "
-                                 "Change-Id's or change numbers to patch. "
-                                 "Please prepend '*' to internal Change-Id's"))
-  parser.add_remote_option('-G', '--rietveld-patches', action='extend',
-                           default=[], type='string',
-                           metavar="'id1[:subdir1]...idN[:subdirN]'",
-                           help=("Space-separated list of short-form Rietveld "
-                                 "issue numbers to patch. If no subdir is "
-                                 "specified, the src directory is used."))
-  parser.add_option('-l', '--list', action='store_true', dest='list',
-                    default=False,
-                    help=('List the suggested trybot configs to use.  Use '
-                          '--all to list all of the available configs.'))
-  parser.add_option('--local', default=False, action='store_true',
-                    help=('Specifies that this tryjob should be run locally.'))
-  parser.add_option('-p', '--local-patches', action='extend', default=[],
-                    metavar="'<project1>[:<branch1>]...<projectN>[:<branchN>]'",
-                    help=('Space-separated list of project branches with '
-                          'patches to apply.  Projects are specified by name. '
-                          'If no branch is specified the current branch of the '
-                          'project will be used.'))
   parser.add_remote_option('--profile', default=None, type='string',
                            action='store', dest='profile',
                            help='Name of profile to sub-specify board variant.')
-  parser.add_option('--remote', default=False, action='store_true',
-                    help=('Specifies that this tryjob should be run remotely.'))
-  parser.add_option('--remote-description', default=None,
-                    help=('Attach an optional description to a --remote run '
-                          'to make it easier to identify the results when it '
-                          'finishes.'))
 
   #
-  # Advanced options
+  # Patch selection options.
+  #
+
+  group = CustomGroup(
+      parser,
+      'Patch Options')
+
+  group.add_remote_option('-g', '--gerrit-patches', action='extend',
+                          default=[], type='string',
+                          metavar="'Id1 *int_Id2...IdN'",
+                          help="Space-separated list of short-form Gerrit "
+                               "Change-Id's or change numbers to patch. "
+                               "Please prepend '*' to internal Change-Id's")
+  group.add_remote_option('-G', '--rietveld-patches', action='extend',
+                          default=[], type='string',
+                          metavar="'id1[:subdir1]...idN[:subdirN]'",
+                          help='Space-separated list of short-form Rietveld '
+                               'issue numbers to patch. If no subdir is '
+                               'specified, the src directory is used.')
+  group.add_option('-p', '--local-patches', action='extend', default=[],
+                   metavar="'<project1>[:<branch1>]...<projectN>[:<branchN>]'",
+                   help='Space-separated list of project branches with '
+                        'patches to apply.  Projects are specified by name. '
+                        'If no branch is specified the current branch of the '
+                        'project will be used.')
+
+  parser.add_option_group(group)
+
+  #
+  # Remote trybot options.
+  #
+
+  group = CustomGroup(
+      parser,
+      'Remote Trybot Options (--remote)')
+
+  group.add_remote_option('--hwtest', dest='hwtest', action='store_true',
+                           default=False,
+                           help='Run the HWTest stage (tests on real hardware)')
+  group.add_option('--remote-description', default=None,
+                   help='Attach an optional description to a --remote run '
+                        'to make it easier to identify the results when it '
+                        'finishes')
+  group.add_option('--slaves', action='extend', default=[],
+                   help='Specify specific remote tryslaves to run on (e.g. '
+                        'build149-m2); if the bot is busy, it will be queued')
+  group.add_option('--test-tryjob', action='store_true',
+                   default=False,
+                   help='Submit a tryjob to the test repository.  Will not '
+                        'show up on the production trybot waterfall.')
+
+  parser.add_option_group(group)
+
+  #
+  # Advanced options.
   #
 
   group = CustomGroup(
@@ -820,6 +907,9 @@ def _CreateParser():
       'Advanced Options',
       'Caution: use these options at your own risk.')
 
+  group.add_remote_option('--bootstrap-args', action='append', default=[],
+                          help='Args passed directly to the bootstrap re-exec '
+                               'to skip verification by the bootstrap code')
   group.add_remote_option('--buildbot', dest='buildbot', action='store_true',
                           default=False, help='This is running on a buildbot')
   group.add_remote_option('--buildnumber', help='build number', type='int',
@@ -835,9 +925,9 @@ def _CreateParser():
   group.add_remote_option('--clobber', action='store_true', dest='clobber',
                           default=False,
                           help='Clears an old checkout before syncing')
-  group.add_remote_option('--hwtest', dest='hwtest', action='store_true',
-                           default=False,
-                           help='This adds HW test for remote trybot')
+  group.add_remote_option('--latest-toolchain', action='store_true',
+                          default=False,
+                          help='Use the latest toolchain.')
   parser.add_option('--log_dir', dest='log_dir', type='path',
                     help=('Directory where logs are stored.'))
   group.add_remote_option('--maxarchives', dest='max_archive_builds',
@@ -845,6 +935,8 @@ def _CreateParser():
                           help="Change the local saved build count limit.")
   parser.add_remote_option('--manifest-repo-url',
                            help=('Overrides the default manifest repo url.'))
+  group.add_remote_option('--compilecheck', action='store_true', default=False,
+                          help='Only verify compilation and unit tests.')
   group.add_remote_option('--noarchive', action='store_false', dest='archive',
                           default=True, help="Don't run archive stage.")
   group.add_remote_option('--nobootstrap', action='store_false',
@@ -862,6 +954,9 @@ def _CreateParser():
   group.add_remote_option('--noprebuilts', action='store_false',
                           dest='prebuilts', default=True,
                           help="Don't upload prebuilts.")
+  group.add_remote_option('--nosdk', action='store_true',
+                          default=False,
+                          help='Re-create the SDK from scratch.')
   group.add_remote_option('--nosync', action='store_false', dest='sync',
                           default=True, help="Don't sync before building.")
   group.add_remote_option('--notests', action='store_false', dest='tests',
@@ -887,16 +982,24 @@ def _CreateParser():
                                'can run for, at which point the build will be '
                                'aborted.  If set to zero, then there is no '
                                'timeout.')
-  group.add_option('--test-tryjob', action='store_true',
-                   default=False,
-                   help='Submit a tryjob to the test repository.  Will not '
-                        'show up on the production trybot waterfall.')
-  group.add_remote_option('--validation_pool', default=None,
-                          help='Path to a pickled validation pool. Intended '
-                               'for use only with the commit queue.')
   group.add_remote_option('--version', dest='force_version', default=None,
                           help='Used with manifest logic.  Forces use of this '
                                'version rather than create or get latest.')
+
+  parser.add_option_group(group)
+
+  #
+  # Internal options.
+  #
+
+  group = CustomGroup(
+      parser,
+      'Internal ChromeOS Build Team Options',
+      'Caution: these are for meant for the ChromeOS build team only')
+
+  group.add_remote_option('--archive-base', type='gs_path',
+                          help='Base GS URL (gs://<bucket_name>/<path>) to '
+                               'upload archive artifacts to')
   group.add_remote_option('--cq-gerrit-query', dest='cq_gerrit_override',
                           default=None,
                           help=
@@ -905,49 +1008,36 @@ def _CreateParser():
       "query it defaults to.  Use with care- note additionally this setting "
       "only has an effect if the buildbot target is a cq target, and we're "
       "in buildbot mode.")
-
-  parser.add_option_group(group)
-
-  #
-  # Hidden options.
-  #
-
-  # The base GS URL (gs://<bucket_name>/<path>) to archive artifacts to.
-  parser.add_remote_option('--archive-base', type='gs_path',
-                          help=optparse.SUPPRESS_HELP)
-  # bootstrap-args are not verified by the bootstrap code.  It gets passed
-  # direcly to the bootstrap re-execution.
-  parser.add_remote_option('--bootstrap-args', action='append',
-                          default=[], help=optparse.SUPPRESS_HELP)
-  parser.add_option('--pass-through', dest='pass_through_args', action='append',
-                   type='string', default=[], help=optparse.SUPPRESS_HELP)
-  # Used for handling forwards/backwards compatibility for --resume and
-  # --bootstrap.
-  parser.add_option('--reexec-api-version', dest='output_api_version',
+  group.add_option('--pass-through', dest='pass_through_args', action='append',
+                   type='string', default=[])
+  group.add_remote_option('--pre-cq', action='store_true', default=False,
+                          help='Mark CLs as tested by the PreCQ on success.')
+  group.add_option('--reexec-api-version', dest='output_api_version',
                    action='store_true', default=False,
-                   help=optparse.SUPPRESS_HELP)
-  # Indicates this is running on a remote trybot machine.
-  parser.add_option('--remote-trybot', dest='remote_trybot',
-                    action='store_true', default=False,
-                    help=optparse.SUPPRESS_HELP)
-  # Patches uploaded by trybot client when run using the -p option.
-  parser.add_remote_option('--remote-patches', action='extend', default=[],
-                          help=optparse.SUPPRESS_HELP)
-  # Specify specific remote tryslaves to run on.
-  parser.add_option('--slaves', action='extend', default=[],
-                   help=optparse.SUPPRESS_HELP)
-  parser.add_option('--sourceroot', type='path', default=constants.SOURCE_ROOT,
-                   help=optparse.SUPPRESS_HELP)
-  # Causes cbuildbot to bootstrap itself twice, in the sequence A->B->C.
-  # A(unpatched) patches and bootstraps B.  B patches and bootstraps C.
-  parser.add_remote_option('--test-bootstrap', action='store_true',
-                          default=False, help=optparse.SUPPRESS_HELP)
+                   help='Used for handling forwards/backwards compatibility '
+                        'with --resume and --bootstrap')
+  group.add_option('--remote-trybot', dest='remote_trybot',
+                   action='store_true', default=False,
+                   help='Indicates this is running on a remote trybot machine')
+  group.add_remote_option('--remote-patches', action='extend', default=[],
+                          help='Patches uploaded by the trybot client when run '
+                               'using the -p option')
   # Note the default here needs to be hardcoded to 3; that is the last version
   # that lacked this functionality.
-  # This is used so that cbuildbot when processing tryjobs from
-  # older chromite instances, we can use it for handling compatibility.
-  parser.add_option('--remote-version', default=3, type=int, action='store',
-                    help=optparse.SUPPRESS_HELP)
+  group.add_option('--remote-version', default=3, type=int, action='store',
+                   help='Used for compatibility checks w/tryjobs running in '
+                        'older chromite instances')
+  group.add_option('--sourceroot', type='path', default=constants.SOURCE_ROOT)
+  group.add_remote_option('--test-bootstrap', action='store_true',
+                          default=False,
+                          help='Causes cbuildbot to bootstrap itself twice, in '
+                               'the sequence A->B->C: A(unpatched) patches and '
+                               'bootstraps B; B patches and bootstraps C')
+  group.add_remote_option('--validation_pool', default=None,
+                          help='Path to a pickled validation pool. Intended '
+                               'for use only with the commit queue.')
+
+  parser.add_option_group(group)
 
   #
   # Debug options
@@ -1127,6 +1217,9 @@ def _ParseCommandLine(parser, argv):
 
 
 def main(argv):
+  # Turn on strict sudo checks.
+  cros_build_lib.STRICT_SUDO = True
+
   # Set umask to 022 so files created by buildbot are readable.
   os.umask(022)
 
@@ -1237,7 +1330,7 @@ def main(argv):
   # Sanity check of buildroot- specifically that it's not pointing into the
   # midst of an existing repo since git-repo doesn't support nesting.
   if (not repository.IsARepoRoot(options.buildroot) and
-      repository.InARepoRepository(options.buildroot)):
+      git.FindRepoDir(options.buildroot)):
     parser.error('Configured buildroot %s points into a repository checkout, '
                  'rather than the root of it.  This is not supported.'
                  % options.buildroot)
@@ -1258,7 +1351,7 @@ def main(argv):
     if not options.resume:
       # If we're in resume mode, use our parents tempdir rather than
       # nesting another layer.
-      stack.Add(osutils.TempDirContextManager, prefix='cbuildbot-tmp')
+      stack.Add(osutils.TempDir, prefix='cbuildbot-tmp', set_global=True)
       logging.debug("Cbuildbot tempdir is %r.", os.environ.get('TMP'))
 
     # TODO(ferringb): update this once https://gerrit.chromium.org/gerrit/25359
@@ -1284,7 +1377,7 @@ def main(argv):
     if not options.buildbot:
       build_config = cbuildbot_config.OverrideConfigForTrybot(
           build_config,
-          options.remote_trybot)
+          options)
 
     if options.buildbot or options.remote_trybot:
       _DisableYamaHardLinkChecks()

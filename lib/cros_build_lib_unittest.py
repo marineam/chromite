@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
 
 import contextlib
+import datetime
 import errno
 import functools
 import itertools
@@ -473,17 +474,18 @@ class TestRunCommandLogging(cros_test_lib.TempDirTestCase):
 
 class TestRetries(cros_test_lib.MoxTestCase):
 
-  def testRetryReturn(self):
-    source = iter(xrange(5)).next
-    tested_source = iter(xrange(5)).next
-    def f(val):
+  def testGenericRetry(self):
+    source, source2 = iter(xrange(5)).next, iter(xrange(5)).next
+    def f():
+      val = source2()
       self.assertEqual(val, source())
-      return val < 4
-    self.assertRaises(cros_build_lib.RetriesExhausted,
-                      cros_build_lib.RetryReturned, f, 3, tested_source)
-    self.assertEqual(4, cros_build_lib.RetryReturned(f, 1, tested_source))
-    self.assertRaises(StopIteration,
-                      cros_build_lib.RetryReturned, f, 3, tested_source)
+      if val < 4:
+        raise ValueError()
+      return val
+    handler = lambda ex: isinstance(ex, ValueError)
+    self.assertRaises(ValueError, cros_build_lib.GenericRetry, handler, 3, f)
+    self.assertEqual(4, cros_build_lib.GenericRetry(handler, 1, f))
+    self.assertRaises(StopIteration, cros_build_lib.GenericRetry, handler, 3, f)
 
   @osutils.TempDirDecorator
   def testBasicRetry(self):
@@ -651,19 +653,22 @@ class HelperMethodSimpleTests(cros_test_lib.TestCase):
     self._TestChromeosVersion(None)
 
   def testUserDateTime(self):
-    old_tz = os.environ.get('TZ')
+    # cros_test_lib.TestCase takes care of saving/restoring the environ.
     os.environ['TZ'] = '0'
     time.tzset()
     timeval = 330005000
     expected = 'Mon, 16 Jun 1980 12:03:20 +0000 ()'
-    try:
-      self.assertEqual(cros_build_lib.UserDateTimeFormat(timeval=timeval),
-                       expected)
-    finally:
-      if old_tz:
-        os.environ['TZ'] = old_tz
-      else:
-        os.environ.pop('TZ')
+    self.assertEqual(cros_build_lib.UserDateTimeFormat(timeval=timeval),
+                     expected)
+
+  def testUserDateTimeDateTime(self):
+    # cros_test_lib.TestCase takes care of saving/restoring the environ.
+    os.environ['TZ'] = '0'
+    time.tzset()
+    timeval = datetime.datetime(1980, 6, 16)
+    expected = 'Mon, 16 Jun 1980 00:00:00 +0000 ()'
+    self.assertEqual(cros_build_lib.UserDateTimeFormat(timeval=timeval),
+                     expected)
 
 
 class YNInteraction():
@@ -702,22 +707,38 @@ class TestInput(cros_test_lib.MoxOutputTestCase):
     self.assertFalse(cros_build_lib.BooleanPrompt())
     self.mox.VerifyAll()
 
+  def testBooleanShellValue(self):
+    """Verify BooleanShellValue() inputs work as expected"""
+    for v in (None,):
+      self.assertTrue(cros_build_lib.BooleanShellValue(v, True))
+      self.assertFalse(cros_build_lib.BooleanShellValue(v, False))
+
+    for v in (1234, '', 'akldjsf', '"'):
+      self.assertRaises(ValueError, cros_build_lib.BooleanShellValue, v, True)
+      self.assertTrue(cros_build_lib.BooleanShellValue(v, True, msg=''))
+      self.assertFalse(cros_build_lib.BooleanShellValue(v, False, msg=''))
+
+    for v in ('yes', 'YES', 'YeS', 'y', 'Y', '1', 'true', 'True', 'TRUE',):
+      self.assertTrue(cros_build_lib.BooleanShellValue(v, True))
+      self.assertTrue(cros_build_lib.BooleanShellValue(v, False))
+
+    for v in ('no', 'NO', 'nO', 'n', 'N', '0', 'false', 'False', 'FALSE',):
+      self.assertFalse(cros_build_lib.BooleanShellValue(v, True))
+      self.assertFalse(cros_build_lib.BooleanShellValue(v, False))
+
 
 class TestTimeouts(cros_test_lib.TestCase):
 
   def testSubCommandTimeout(self):
     """Tests that we can nest SubCommandTimeout correctly."""
     self.assertFalse('mock' in str(time.sleep).lower())
-    with cros_build_lib.SubCommandTimeout(4):
-      with cros_build_lib.SubCommandTimeout(3):
+    with cros_build_lib.SubCommandTimeout(30):
+      with cros_build_lib.SubCommandTimeout(20):
         with cros_build_lib.SubCommandTimeout(1):
-          self.assertRaises(cros_build_lib.TimeoutError, time.sleep, 5)
+          self.assertRaises(cros_build_lib.TimeoutError, time.sleep, 10)
 
-        # Should not raise a timeout exception as 3 > 2.
+        # Should not raise a timeout exception as 20 > 2.
         time.sleep(1)
-
-      # Should raise a timeout exception.
-      self.assertRaises(cros_build_lib.TimeoutError, time.sleep, 5)
 
   def testSubCommandTimeoutNested(self):
     """Tests that we still re-raise an alarm if both are reached."""

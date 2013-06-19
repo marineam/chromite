@@ -9,6 +9,7 @@ ready for the commit queue to try.
 """
 
 import contextlib
+import cPickle
 import logging
 import sys
 import time
@@ -18,14 +19,17 @@ from xml.dom import minidom
 from chromite.buildbot import cbuildbot_results as results_lib
 from chromite.buildbot import constants
 from chromite.buildbot import lkgm_manager
+from chromite.buildbot import manifest_version
 from chromite.buildbot import portage_utilities
 from chromite.lib import cros_build_lib
 from chromite.lib import gerrit
 from chromite.lib import git
+from chromite.lib import gs
 from chromite.lib import patch as cros_patch
 
-_BUILD_DASHBOARD = 'http://build.chromium.org/p/chromiumos'
-_BUILD_INT_DASHBOARD = 'http://uberchromegw.corp.google.com/i/chromeos'
+# Third-party libraries bundled with chromite need to be listed after the
+# first chromite import.
+import digraph
 
 # We import mox so that w/in ApplyPoolIntoRepo, if a mox exception is
 # thrown, we don't cover it up.
@@ -70,30 +74,29 @@ class NoMatchingChangeFoundException(Exception):
 class DependencyNotReadyForCommit(cros_patch.PatchException):
   """Exception thrown when a required dep isn't satisfied."""
 
-  def __init__(self, patch, unsatisfied_dep):
-    cros_patch.PatchException.__init__(self, patch)
-    self.unsatisfied_dep = unsatisfied_dep
-    self.args += (unsatisfied_dep,)
-
   def __str__(self):
-    return ("Change %s isn't ready for CQ/commit since its dependency "
-            "%s isn't committed, or marked as Commit-Ready."
-            % (self.patch, self.unsatisfied_dep))
+    return "%s isn't committed, or marked as Commit-Ready." % (self.patch,)
 
 
 def _RunCommand(cmd, dryrun):
-  """Runs the specified shell cmd if dryrun=False."""
+  """Runs the specified shell cmd if dryrun=False.
+
+  Errors are ignored, but logged.
+  """
   if dryrun:
     logging.info('Would have run: %s', ' '.join(cmd))
-  else:
-    cros_build_lib.RunCommand(cmd, error_code_ok=True)
+    return
 
+  try:
+    cros_build_lib.RunCommand(cmd)
+  except cros_build_lib.RunCommandError:
+    cros_build_lib.Error('Command failed', exc_info=True)
 
 class GerritHelperNotAvailable(gerrit.GerritException):
   """Exception thrown when a specific helper is requested but unavailable."""
 
   def __init__(self, remote=constants.EXTERNAL_REMOTE):
-    gerrit.GerritException.__init__()
+    gerrit.GerritException.__init__(self)
     # Stringify the pool so that serialization doesn't try serializing
     # the actual HelperPool.
     self.remote = remote
@@ -101,7 +104,7 @@ class GerritHelperNotAvailable(gerrit.GerritException):
 
   def __str__(self):
     return (
-        "Needed a remote=%s gerrit_helper, but one isn't allowed by this"
+        "Needed a remote=%s gerrit_helper, but one isn't allowed by this "
         "HelperPool instance.") % (self.remote,)
 
 
@@ -223,18 +226,52 @@ class PatchSeries(object):
     self._lookup_cache = cros_patch.PatchCache()
     self._change_deps_cache = {}
 
-  def GetTrackingBranchForChange(self, change, for_gerrit=False):
-    """Identify the branch to work against for this change.
+  def _ManifestDecorator(functor):
+    """Method decorator that sets self.manifest automatically.
+
+    This function automatically initializes the manifest, and allows callers to
+    override the manifest if needed.
+    """
+    # pylint: disable=E0213,W0212,E1101,E1102
+    def f(self, *args, **kwargs):
+      manifest = kwargs.pop('manifest', None)
+      # Wipe is used to track if we need to reset manifest to None, and
+      # to identify if we already had a forced_manifest via __init__.
+      wipe = self.manifest is None
+      if manifest:
+        if not wipe:
+          raise ValueError("manifest can't be specified when one is forced "
+                           "via __init__")
+      elif wipe:
+        manifest = git.ManifestCheckout.Cached(self._path)
+      else:
+        manifest = self.manifest
+
+      try:
+        self.manifest = manifest
+        return functor(self, *args, **kwargs)
+      finally:
+        if wipe:
+          self.manifest = None
+
+    f.__name__ = functor.__name__
+    f.__doc__ = functor.__doc__
+    return f
+
+  @_ManifestDecorator
+  def GetGitRepoForChange(self, change):
+    """Get the project path associated with the specified change.
 
     Args:
-      gerrit: If True, give the shortened form; no refs/heads, no refs/remotes.
+      change: The change to operate on.
+
+    Returns:
+      The project path if found in the manifest. Otherwise returns None.
     """
-    ref = self.manifest.GetProjectsLocalRevision(change.project)
-    return git.StripRefs(ref) if for_gerrit else ref
+    if self.manifest and self.manifest.ProjectExists(change.project):
+      return self.manifest.GetProjectPath(change.project, True)
 
-  def GetGitRepoForChange(self, change):
-    return self.manifest.GetProjectPath(change.project, True)
-
+  @_ManifestDecorator
   def _IsContentMerging(self, change):
     """Discern if the given change has Content Merging enabled in gerrit.
 
@@ -250,26 +287,21 @@ class PatchSeries(object):
     """
     if self.force_content_merging:
       return True
-    helper = self._helper_pool.ForChange(change)
+    return self.manifest.ProjectIsContentMerging(change.project)
 
-    if not helper.version.startswith('2.1'):
-      return self.manifest.ProjectIsContentMerging(change.project)
-
-    # Fallback to doing gsql trickery to get it; note this requires admin
-    # access.  This isn't required for CrOS anymore, but is left in place
-    # should a thirdparty not yet be on >=2.2
-    projects = self._content_merging_projects.get(helper)
-    if projects is None:
-      projects = helper.FindContentMergingProjects()
-      self._content_merging_projects[helper] = projects
-
-    return change.project in projects
-
+  @_ManifestDecorator
   def ApplyChange(self, change, dryrun=False):
     # If we're in dryrun mode, then 3way is always allowed.
     # Otherwise, allow 3way only if the gerrit project allows it.
     trivial = False if dryrun else not self._IsContentMerging(change)
     return change.ApplyAgainstManifest(self.manifest, trivial=trivial)
+
+  def _LookupHelper(self, query):
+    """Returns the helper for a given query."""
+    remote = constants.EXTERNAL_REMOTE
+    if query.startswith('*'):
+      remote = constants.INTERNAL_REMOTE
+    return self._helper_pool.GetHelper(remote)
 
   def _GetGerritPatch(self, change, query, parent_lookup=False):
     """Query the configured helpers looking for a given change.
@@ -282,17 +314,8 @@ class PatchSeries(object):
         of the given change- as such limit the query purely to that
         project/branch.
     """
-    remote = constants.EXTERNAL_REMOTE
-    if query.startswith('*'):
-      remote = constants.INTERNAL_REMOTE
-    helper = self._helper_pool.GetHelper(remote)
-
+    helper = self._LookupHelper(query)
     query = query_text = cros_patch.FormatPatchDep(query, force_external=True)
-    if parent_lookup:
-      query_text = "project:%s AND branch:%s AND %s" % (
-          change.project,
-          self.GetTrackingBranchForChange(change, True),
-          query_text)
     change = helper.QuerySingleRecord(query_text, must_match=True)
     # If the query was a gerrit number based query, check the projects/change-id
     # to see if we already have it locally, but couldn't map it since we didn't
@@ -301,9 +324,8 @@ class PatchSeries(object):
         cros_patch.FormatChangeId(
             change.change_id, force_internal=change.internal, strict=False)]
     if query.isdigit() and existing is not None:
-      if ((existing.project == change.project
-          and existing.tracking_branch == change.tracking_branch)
-          or not parent_lookup):
+      if (not parent_lookup or existing.project == change.project and
+          existing.tracking_branch == change.tracking_branch):
         key = cros_patch.FormatGerritNumber(
             str(change.gerrit_number), force_internal=change.internal,
             strict=False)
@@ -325,7 +347,7 @@ class PatchSeries(object):
       deps: A sequence of dependencies for the parent that we need to identify
         as either merged, or needing resolving.
       parent_lookup: If True, this means we're trying to trace out the git
-        parentage of a change, thus limit the lookup to the parents project
+        parentage of a change, thus limit the lookup to the parent's project
         and branch.
       limit_to: If non-None, then this must be a mapping (preferably a
         cros_patch.PatchCache for translation reasons) of which non-committed
@@ -339,16 +361,20 @@ class PatchSeries(object):
       if dep in self._committed_cache:
         continue
 
+      try:
+        self._LookupHelper(dep)
+      except GerritHelperNotAvailable:
+        # Internal dependencies are irrelevant to external builders.
+        logging.info("Skipping internal dependency: %s", dep)
+        continue
+
       dep_change = self._lookup_cache[dep]
-      if parent_lookup and dep_change is not None:
-        if not (parent.project == dep_change.project and
-                self.GetTrackingBranchForChange(parent, True) ==
-                self.GetTrackingBranchForChange(dep_change, True)):
-          # TODO(build): In this scenario, the cache will get updated
-          # with the new CL pulled from gerrit; this is questionable,
-          # but there isn't a good answer here.  Rare enough it's being
-          # ignored either way.
-          dep_change = None
+
+      if (parent_lookup and dep_change is not None and
+          (parent.project != dep_change.project or
+           parent.tracking_branch != dep_change.tracking_branch)):
+        logging.warn('Found different CL with matching lookup key in cache')
+        dep_change = None
 
       if dep_change is None:
         dep_change = self._GetGerritPatch(parent, dep,
@@ -357,7 +383,7 @@ class PatchSeries(object):
       if getattr(dep_change, 'IsAlreadyMerged', lambda: False)():
         continue
       elif limit_to is not None and dep_change not in limit_to:
-        raise DependencyNotReadyForCommit(parent, dep)
+        raise DependencyNotReadyForCommit(dep_change)
 
       unsatisfied.append(dep_change)
 
@@ -369,7 +395,7 @@ class PatchSeries(object):
 
     In this case, a transaction is defined as a group of commits that
     must land for the given change to be merged- specifically its
-    parent deps, and its CQ-DEPENDS.
+    parent deps, and its CQ-DEPEND.
 
     Args:
       change: A cros_patch.GitRepoPatch instance to generate a transaction
@@ -377,12 +403,76 @@ class PatchSeries(object):
       limit_to: If non-None, limit the allowed uncommitted patches to
         what's in that container/mapping.
     Returns:
-      A sequency of the necessary cros_patch.GitRepoPatch objects for
+      A sequence of the necessary cros_patch.GitRepoPatch objects for
       this transaction.
     """
     plan, stack = [], cros_patch.PatchCache()
     self._ResolveChange(change, plan, stack, limit_to=limit_to)
     return plan
+
+  def CreateTransactions(self, changes, limit_to=None):
+    """Create a list of transactions from a list of changes.
+
+    Args:
+      changes: A list of cros_patch.GitRepoPatch instances to generate
+        transactions for.
+      limit_to: See CreateTransaction docs.
+
+    Returns:
+      A list of (change, plan) tuples for the given list of changes. Each
+      plan represents the necessary GitRepoPatch objects for a given change.
+    """
+    for change in changes:
+      try:
+        plan = self.CreateTransaction(change, limit_to=limit_to)
+      except cros_patch.PatchException as exc:
+        yield (change, (), exc)
+      else:
+        yield (change, plan, None)
+
+  def CreateDisjointTransactions(self, changes):
+    """Create a list of disjoint transactions from a list of changes.
+
+    Args:
+      changes: A list of cros_patch.GitRepoPatch instances to generate
+        transactions for.
+
+    Returns:
+      A list of disjoint transactions and a list of exceptions. Each transaction
+      can be tried independently, without involving patches from other
+      transactions. Each change in the pool will included in exactly one of the
+      transactions, unless the patch does not apply for some reason.
+    """
+    # Gather the dependency graph for the specified changes.
+    deps, edges, failed = {}, {}, []
+    for change, plan, ex in self.CreateTransactions(changes, limit_to=changes):
+      if ex is not None:
+        logging.info('Failed creating transaction for %s: %s', change, ex)
+        failed.append(ex)
+      else:
+        # Save off the ordered dependencies of this change.
+        deps[change] = plan
+
+        # Mark every change in the transaction as bidirectionally connected.
+        for change_dep in plan:
+          edges.setdefault(change_dep, set()).update(plan)
+
+    # Calculate an unordered group of strongly connected components.
+    unordered_plans = digraph.StronglyConnectedComponents(list(edges), edges)
+
+    # Sort the groups according to our ordered dependency graph.
+    ordered_plans = []
+    for unordered_plan in unordered_plans:
+      ordered_plan, seen = [], set()
+      for change in unordered_plan:
+        # Iterate over the required CLs, adding them to our plan in order.
+        for change_dep in deps[change]:
+          if change_dep not in seen:
+            ordered_plan.append(change_dep)
+            seen.add(change_dep)
+      ordered_plans.append(ordered_plan)
+
+    return ordered_plans, failed
 
   def _ResolveChange(self, change, plan, stack, limit_to=None):
     """Helper for resolving a node and its dependencies into the plan.
@@ -423,14 +513,11 @@ class PatchSeries(object):
     Returns:
       A tuple of the change's GerritDependencies(), and PaladinDependencies()
     """
-    # TODO(sosa, ferringb): Modify helper logic to allows deps to be specified
-    # across different gerrit instances.
     val = self._change_deps_cache.get(change)
     if val is None:
       git_repo = self.GetGitRepoForChange(change)
       val = self._change_deps_cache[change] = (
-          change.GerritDependencies(
-              git_repo, self.GetTrackingBranchForChange(change)),
+          change.GerritDependencies(),
           change.PaladinDependencies(git_repo))
     return val
 
@@ -473,42 +560,24 @@ class PatchSeries(object):
     self._lookup_cache.Inject(*changes)
 
   def FetchChanges(self, changes):
-    for change in changes:
-      change.Fetch(self.GetGitRepoForChange(change))
+    """Fetch the specified changes, if needed.
 
-  def _ApplyDecorator(functor):
-    """Decorator for Apply that does appropriate self.manifest manipulation.
+    If we're an external builder, internal changes are filtered out.
 
-    Note this is implemented in this fashion so that we can be sure the
-    instances manifest attribute is properly maintained, and so that we
-    don't have to tell people "go look at docstring blah".
+    Returns:
+      An iterator over a list of the filtered changes.
     """
-    # pylint: disable=E0213,W0212,E1101,E1102
-    def f(self, changes, **kwargs):
-      manifest = kwargs.pop('manifest', None)
-      # Wipe is used to track if we need to reset manifest to None, and
-      # to identify if we already had a forced_manifest via __init__.
-      wipe = self.manifest is None
-      if manifest:
-        if not wipe:
-          raise ValueError("manifest can't be specified when one is forced "
-                           "via __init__")
-      elif wipe:
-        manifest = git.ManifestCheckout.Cached(self._path)
-      else:
-        manifest = self.manifest
-
+    for change in changes:
       try:
-        self.manifest = manifest
-        return functor(self, changes, **kwargs)
-      finally:
-        if wipe:
-          self.manifest = None
-    f.__name__ = functor.__name__
-    f.__doc__ = functor.__doc__
-    return f
+        self._helper_pool.ForChange(change)
+      except GerritHelperNotAvailable:
+        # Internal patches are irrelevant to external builders.
+        logging.info("Skipping internal patch: %s", change)
+        continue
+      change.Fetch(self.GetGitRepoForChange(change))
+      yield change
 
-  @_ApplyDecorator
+  @_ManifestDecorator
   def Apply(self, changes, dryrun=False, frozen=True,
             honor_ordering=False, changes_filter=None):
     """Applies changes from pool into the build root specified by the manifest.
@@ -553,21 +622,19 @@ class PatchSeries(object):
 
     # Prefetch the changes; we need accurate change_id/id's, which is
     # guaranteed via Fetch.
-    self.FetchChanges(changes)
+    changes = list(self.FetchChanges(changes))
     if changes_filter:
       changes = changes_filter(self, changes)
 
     self.InjectLookupCache(changes)
-    allowed_changes = cros_patch.PatchCache(changes) if frozen else None
+    limit_to = cros_patch.PatchCache(changes) if frozen else None
     resolved, applied, failed = [], [], []
-    for change in changes:
-      try:
-        resolved.append(
-            (change, self.CreateTransaction(change, limit_to=allowed_changes)))
-      except cros_patch.PatchException, e:
-        logging.info("Failed creating transaction for %s: %s", change, e)
-        failed.append(e)
+    for change, plan, ex in self.CreateTransactions(changes, limit_to=limit_to):
+      if ex is not None:
+        logging.info("Failed creating transaction for %s: %s", change, ex)
+        failed.append(ex)
       else:
+        resolved.append((change, plan))
         logging.info("Transaction for %s is %s.",
             change, ', '.join(map(str, resolved[-1][-1])))
 
@@ -747,7 +814,7 @@ class PatchSeries(object):
 class _ManifestShim(object):
   """Class used in conjunction with PatchSeries to support standalone git repos.
 
-  This works via duck typing; we match the 3 necessary methods that PatchSeries
+  This works via duck typing; we match the 4 necessary methods that PatchSeries
   uses."""
 
   def __init__(self, path, tracking_branch, remote='origin',
@@ -763,6 +830,9 @@ class _ManifestShim(object):
   def GetProjectPath(self, _project, _absolute=False):
     return self.path
 
+  def ProjectExists(self, _project):
+    return True
+
   def ProjectIsContentMerging(self, _project):
     return self.content_merging
 
@@ -770,28 +840,22 @@ class _ManifestShim(object):
 class ValidationFailedMessage(object):
   """Message indicating that changes failed to be validated."""
 
-  def __init__(self, builder_name, build_log, tracebacks, internal):
+  def __init__(self, message, tracebacks, internal):
     """Create a ValidationFailedMessage object.
 
     Args:
-      builder_name: The URL-quoted name of the builder.
-      build_log: The URL users should visit to see the build log.
-      tracebacks: A list of results_lib.RecordedTraceback objects.
+      message: The message to print.
+      tracebacks: Exceptions received by individual builders, if any.
       internal: Whether this failure occurred on an internal builder.
     """
-    self.builder_name = builder_name
-    self.build_log = build_log
+    # Convert each of the input arguments into simple Python datastructures
+    # (i.e. not generators) that can be easily pickled.
+    self.message = str(message)
     self.tracebacks = tuple(tracebacks)
-    self.internal = internal
+    self.internal = bool(internal)
 
   def __str__(self):
-    details = []
-    for x in self.tracebacks:
-      details.append('The %s stage failed: %s' % (x.failed_stage, x.exception))
-    if not details:
-      details = ['cbuildbot failed']
-    details.append('in %s' % (self.build_log,))
-    return '%s: %s' % (urllib.unquote(self.builder_name), ' '.join(details))
+    return self.message
 
 
 class ValidationPool(object):
@@ -808,6 +872,11 @@ class ValidationPool(object):
   MAX_TIMEOUT = 60 * 60 * 4
   SLEEP_TIMEOUT = 30
   STATUS_URL = 'https://chromiumos-status.appspot.com/current?format=json'
+  STATUS_FAILED = manifest_version.BuilderStatus.STATUS_FAILED
+  STATUS_INFLIGHT = manifest_version.BuilderStatus.STATUS_INFLIGHT
+  STATUS_PASSED = manifest_version.BuilderStatus.STATUS_PASSED
+  STATUS_LAUNCHING = 'launching'
+  STATUS_WAITING = 'waiting'
 
   # The grace period (in seconds) before we reject a patch due to dependency
   # errors.
@@ -815,7 +884,7 @@ class ValidationPool(object):
 
   def __init__(self, overlays, build_root, build_number, builder_name,
                is_master, dryrun, changes=None, non_os_changes=None,
-               conflicting_changes=None, helper_pool=None):
+               conflicting_changes=None, pre_cq=False):
     """Initializes an instance by setting default valuables to instance vars.
 
     Generally use AcquirePool as an entry pool to a pool rather than this
@@ -834,23 +903,19 @@ class ValidationPool(object):
       changes_that_failed_to_apply_earlier: Changes that failed to apply but
         we're keeping around because they conflict with other changes in
         flight.
-      helper_pool: A HelperPool instance.  If not specified, a HelperPool
-        instance is created with full access to external and internal gerrit
-        instances; full access is used to allow cross gerrit dependencies
-        to be supported.
+      pre_cq: If set to True, this builder is verifying CLs before they go to
+        the commit queue.
     """
 
-    if helper_pool is None:
-      helper_pool = HelperPool.SimpleCreate()
-
     self.build_root = build_root
-    self._helper_pool = helper_pool
 
     # These instances can be instantiated via both older, or newer pickle
     # dumps.  Thus we need to assert the given args since we may be getting
     # a value we no longer like (nor work with).
     if overlays not in constants.VALID_OVERLAYS:
       raise ValueError("Unknown/unsupported overlay: %r" % (overlays,))
+
+    self._helper_pool = self.GetGerritHelpersForOverlays(overlays)
 
     if not isinstance(build_number, int):
       raise ValueError("Invalid build_number: %r" % (build_number,))
@@ -875,13 +940,13 @@ class ValidationPool(object):
           'cros_patch.PatchException derivative, got %r'
           % (conflicting_changes,))
 
-    build_dashboard = self.GetBuildDashboardForOverlays(overlays)
-
-    self.build_log = '%s/builders/%s/builds/%s' % (
-        build_dashboard, builder_name, str(build_number))
+    self.build_log = self.ConstructDashboardURL(overlays, pre_cq, builder_name,
+                                                str(build_number))
 
     self.is_master = bool(is_master)
+    self.pre_cq = pre_cq
     self.dryrun = bool(dryrun) or self.GLOBAL_DRYRUN
+    self.queue = 'A trybot' if pre_cq else 'The Commit Queue'
 
     # See optional args for types of changes.
     self.changes = changes or []
@@ -896,19 +961,42 @@ class ValidationPool(object):
     self._overlays = overlays
     self._build_number = build_number
     self._builder_name = builder_name
-    self._patch_series = PatchSeries(self.build_root, helper_pool=helper_pool)
+    self._patch_series = PatchSeries(self.build_root,
+                                     helper_pool=self._helper_pool)
 
   @staticmethod
-  def GetBuildDashboardForOverlays(overlays):
+  def GetBuildDashboardForOverlays(overlays, trybot):
     """Discern the dashboard to use based on the given overlay."""
+    if trybot:
+      return constants.TRYBOT_DASHBOARD
     if overlays in [constants.PRIVATE_OVERLAYS, constants.BOTH_OVERLAYS]:
-      return _BUILD_INT_DASHBOARD
-    return _BUILD_DASHBOARD
+      return constants.BUILD_INT_DASHBOARD
+    return constants.BUILD_DASHBOARD
+
+  @classmethod
+  def ConstructDashboardURL(cls, overlays, trybot, builder_name, build_number,
+                            stage=None):
+    """Return the dashboard (buildbot) URL for this run
+
+    Args:
+      overlays: One of constants.VALID_OVERLAYS.
+      trybot: Boolean: is this a remote trybot?
+      builder_name: Builder name on buildbot dashboard.
+      build_number: Build number for this validation attempt.
+      stage: Link directly to a stage log, else use the general landing page.
+    Returns:
+      The fully formed URL
+    """
+    build_dashboard = cls.GetBuildDashboardForOverlays(overlays, trybot)
+    url = '%s/builders/%s/builds/%s' % (build_dashboard, builder_name,
+                                        str(build_number))
+    if stage:
+      url += '/steps/%s/logs/stdio' % (stage,)
+    return url
 
   @staticmethod
   def GetGerritHelpersForOverlays(overlays):
     """Discern the allowed GerritHelpers to use based on the given overlay."""
-    # TODO(sosa): Remove False case once overlays logic has stabilized on TOT.
     cros_internal = cros = False
     if overlays in [constants.PUBLIC_OVERLAYS, constants.BOTH_OVERLAYS, False]:
       cros = True
@@ -927,24 +1015,65 @@ class ValidationPool(object):
             self.build_root, self._build_number, self._builder_name,
             self.is_master, self.dryrun, self.changes,
             self.non_manifest_changes,
-            self.changes_that_failed_to_apply_earlier))
+            self.changes_that_failed_to_apply_earlier,
+            self.pre_cq))
 
   @classmethod
-  def AcquirePool(cls, overlays, build_root, build_number, builder_name,
-                  dryrun=False, changes_query=None):
+  def FilterNonMatchingChanges(cls, changes):
+    """Filter out changes that don't actually match our query.
+
+    Generally, Gerrit should only return patches that match our query. However,
+    there are race conditions (bugs in Gerrit) where the final patch won't
+    match our query.
+
+    Here's an example problem that this code fixes: If the Pre-CQ launcher
+    picks up a CL while the CQ is committing the CL, it may catch a race
+    condition where a new patchset has been created and committed by the CQ,
+    but the CL is still treated as if it matches the query (which it doesn't,
+    anymore).
+
+    Arguments:
+      changes: List of changes to filter.
+
+    Returns:
+      List of changes that match our query.
+    """
+    for change in changes:
+      # Check that the user (or chrome-bot) uploaded a new change under our
+      # feet while Gerrit was in the middle of answering our query.
+      for field, value in constants.DEFAULT_CQ_READY_FIELDS.iteritems():
+        if not change.HasApproval(field, value):
+          break
+      else:
+        yield change
+
+  @classmethod
+  def AcquirePreCQPool(cls, *args, **kwargs):
+    """See ValidationPool.__init__ for arguments."""
+    kwargs.setdefault('pre_cq', True)
+    kwargs.setdefault('is_master', True)
+    return cls(*args, **kwargs)
+
+  @classmethod
+  def AcquirePool(cls, overlays, repo, build_number, builder_name,
+                  dryrun=False, changes_query=None, check_tree_open=True,
+                  change_filter=None):
     """Acquires the current pool from Gerrit.
 
     Polls Gerrit and checks for which change's are ready to be committed.
 
     Args:
       overlays:  One of constants.VALID_OVERLAYS.
-      build_root: The location of the build root used to filter projects, and
-        to apply patches against.
+      repo: The repo used to sync, to filter projects, and to apply patches
+        against.
       build_number: Corresponding build number for the build.
       builder_name:  Builder name on buildbot dashboard.
       dryrun: Don't submit anything to gerrit.
       changes_query: The gerrit query to use to identify changes; if None,
         uses the internal defaults.
+      check_tree_open: If True, only return when the tree is open.
+      change_filter: If set, use change_filter(pool, changes,
+        non_manifest_changes) to filter out unwanted patches.
     Returns:
       ValidationPool object.
     Raises:
@@ -953,30 +1082,47 @@ class ValidationPool(object):
 
     if changes_query is None:
       changes_query = constants.DEFAULT_CQ_READY_QUERY
+    if change_filter is None:
+      change_filter = lambda _, x, y: (x, y)
 
     # We choose a longer wait here as we haven't committed to anything yet. By
     # doing this here we can reduce the number of builder cycles.
     end_time = time.time() + cls.MAX_TIMEOUT
     while True:
       time_left = end_time - time.time()
-      if not dryrun and not cros_build_lib.TreeOpen(
+
+      # Wait until the tree opens.
+      if check_tree_open and not cros_build_lib.TreeOpen(
           cls.STATUS_URL, cls.SLEEP_TIMEOUT, max_timeout=time_left):
         raise TreeIsClosedException()
 
+      # Sync so that we are up-to-date on what is committed.
+      repo.Sync()
+
       # Only master configurations should call this method.
-      pool = ValidationPool(overlays, build_root, build_number, builder_name,
-                            True, dryrun)
+      pool = ValidationPool(overlays, repo.directory, build_number,
+                            builder_name, True, dryrun)
+
       # Iterate through changes from all gerrit instances we care about.
       for helper in cls.GetGerritHelpersForOverlays(overlays):
         raw_changes = helper.Query(changes_query, sort='lastUpdated')
         raw_changes.reverse()
 
+        # Verify the results match the query, to prevent race conditions.
+        if changes_query == constants.DEFAULT_CQ_READY_QUERY:
+          raw_changes = cls.FilterNonMatchingChanges(raw_changes)
+
         changes, non_manifest_changes = ValidationPool._FilterNonCrosProjects(
-            raw_changes, git.ManifestCheckout.Cached(build_root))
+            raw_changes, git.ManifestCheckout.Cached(repo.directory))
         pool.changes.extend(changes)
         pool.non_manifest_changes.extend(non_manifest_changes)
 
-      if pool.changes or pool.non_manifest_changes or dryrun or time_left < 0:
+      # Filter out unwanted changes.
+      pool.changes, pool.non_manifest_changes = change_filter(
+          pool, pool.changes, pool.non_manifest_changes)
+
+      if (pool.changes or pool.non_manifest_changes or dryrun or time_left < 0
+          or cls.ShouldExitEarly()):
         break
 
       logging.info('Waiting for new CLs (%d minutes left)...', time_left / 60)
@@ -985,13 +1131,16 @@ class ValidationPool(object):
     return pool
 
   @classmethod
-  def AcquirePoolFromManifest(cls, manifest, overlays, build_root, build_number,
+  def AcquirePoolFromManifest(cls, manifest, overlays, repo, build_number,
                               builder_name, is_master, dryrun):
     """Acquires the current pool from a given manifest.
+
+    This function assumes that you have already synced to the given manifest.
 
     Args:
       manifest: path to the manifest where the pool resides.
       overlays:  One of constants.VALID_OVERLAYS.
+      repo: The repo used to filter projects and to apply patches against.
       build_number: Corresponding build number for the build.
       builder_name:  Builder name on buildbot dashboard.
       is_master: Boolean that indicates whether this is a pool for a master.
@@ -1000,7 +1149,7 @@ class ValidationPool(object):
     Returns:
       ValidationPool object.
     """
-    pool = ValidationPool(overlays, build_root, build_number, builder_name,
+    pool = ValidationPool(overlays, repo.directory, build_number, builder_name,
                           is_master, dryrun)
     manifest_dom = minidom.parse(manifest)
     pending_commits = manifest_dom.getElementsByTagName(
@@ -1022,6 +1171,14 @@ class ValidationPool(object):
             'Could not find change defined by %s' % pending_commit)
 
     return pool
+
+  @classmethod
+  def ShouldExitEarly(cls):
+    """Return whether we should exit early.
+
+    This function is intended to be overridden by tests or by subclasses.
+    """
+    return False
 
   @staticmethod
   def _FilterNonCrosProjects(changes, manifest):
@@ -1131,7 +1288,7 @@ class ValidationPool(object):
           "infinite loop hanging on these CLs." % (e,))
       cros_build_lib.Error(
           "%s\nAffected Patches are: %s", msg,
-          ', '.join(x.change_id for x in self.changes))
+          ', '.join('CL:%s' % x.gerrit_number_str for x in self.changes))
       try:
         self._HandleApplyFailure(
             [InternalCQError(patch, msg) for patch in self.changes])
@@ -1165,43 +1322,63 @@ class ValidationPool(object):
 
     return bool(self.changes)
 
+  @staticmethod
+  def Load(filename):
+    """Loads the validation pool from the file."""
+    with open(filename, 'rb') as p_file:
+      return cPickle.load(p_file)
+
+  def Save(self, filename):
+    """Serializes the validation pool."""
+    with open(filename, 'wb') as p_file:
+      cPickle.dump(self, p_file, protocol=cPickle.HIGHEST_PROTOCOL)
+
   # Note: All submit code, all gerrit code, and basically everything other
   # than patch resolution/applying needs to use .change_id from patch objects.
   # Basically all code from this point forward.
 
-  def _SubmitChanges(self, changes):
+  def _SubmitChanges(self, changes, check_tree_open=True):
     """Submits given changes to Gerrit.
 
     Args:
       changes: GerritPatch's to submit.
+      check_tree_open: Whether to check that the tree is open before submitting
+        changes. If this is False, TreeIsClosedException will never be raised.
 
     Raises:
       TreeIsClosedException: if the tree is closed.
       FailedToSubmitAllChangesException: if we can't submit a change.
     """
     assert self.is_master, 'Non-master builder calling SubmitPool'
+    assert not self.pre_cq, 'Trybot calling SubmitPool'
+
     changes_that_failed_to_submit = []
     # We use the default timeout here as while we want some robustness against
     # the tree status being red i.e. flakiness, we don't want to wait too long
     # as validation can become stale.
-    if not self.dryrun and not cros_build_lib.TreeOpen(
+    if check_tree_open and not self.dryrun and not cros_build_lib.TreeOpen(
         self.STATUS_URL, self.SLEEP_TIMEOUT):
       raise TreeIsClosedException()
 
-    for change in changes:
-      was_change_submitted = False
-      logging.info('Change %s will be submitted', change)
-      try:
-        self._SubmitChange(change)
-        was_change_submitted = self._helper_pool.ForChange(
-            change).IsChangeCommitted(str(change.gerrit_number), self.dryrun)
-      except cros_build_lib.RunCommandError:
-        logging.error('gerrit review --submit failed for change.')
-      finally:
-        if not was_change_submitted:
-          logging.error('Could not submit %s', str(change))
-          self._HandleCouldNotSubmit(change)
-          changes_that_failed_to_submit.append(change)
+    plans, _ = self._patch_series.CreateDisjointTransactions(changes)
+
+    for plan in plans:
+      for change in plan:
+        was_change_submitted = False
+        logging.info('Change %s will be submitted', change)
+        try:
+          self._SubmitChange(change)
+          was_change_submitted = self._helper_pool.ForChange(
+              change).IsChangeCommitted(str(change.gerrit_number), self.dryrun)
+        except cros_build_lib.RunCommandError:
+          logging.error('gerrit review --submit failed for change.')
+        finally:
+          if not was_change_submitted:
+            changes_that_failed_to_submit.append(change)
+
+    for change in changes_that_failed_to_submit:
+      logging.error('Could not submit %s', str(change))
+      self._HandleCouldNotSubmit(change)
 
     if changes_that_failed_to_submit:
       raise FailedToSubmitAllChangesException(changes_that_failed_to_submit)
@@ -1213,17 +1390,31 @@ class ValidationPool(object):
 
     _RunCommand(cmd, self.dryrun)
 
-  def SubmitNonManifestChanges(self):
+  def RemoveCommitReady(self, change):
+    """Remove the commit ready bit for the specified |change|."""
+    self._helper_pool.ForChange(change).RemoveCommitReady(change,
+        dryrun=self.dryrun)
+
+  def SubmitNonManifestChanges(self, check_tree_open=True):
     """Commits changes to Gerrit from Pool that aren't part of the checkout.
+
+    Args:
+      check_tree_open: Whether to check that the tree is open before submitting
+        changes. If this is False, TreeIsClosedException will never be raised.
 
     Raises:
       TreeIsClosedException: if the tree is closed.
       FailedToSubmitAllChangesException: if we can't submit a change.
     """
-    self._SubmitChanges(self.non_manifest_changes)
+    self._SubmitChanges(self.non_manifest_changes,
+                        check_tree_open=check_tree_open)
 
-  def SubmitPool(self):
+  def SubmitPool(self, check_tree_open=True):
     """Commits changes to Gerrit from Pool.  This is only called by a master.
+
+    Args:
+      check_tree_open: Whether to check that the tree is open before submitting
+        changes. If this is False, TreeIsClosedException will never be raised.
 
     Raises:
       TreeIsClosedException: if the tree is closed.
@@ -1232,10 +1423,10 @@ class ValidationPool(object):
     # Note that _SubmitChanges can throw an exception if it can't
     # submit all changes; in that particular case, don't mark the inflight
     # failures patches as failed in gerrit- some may apply next time we do
-    # a CQ run (since the# submit state has changed, we have no way of
+    # a CQ run (since the submit state has changed, we have no way of
     # knowing).  They *likely* will still fail, but this approach tries
     # to minimize wasting the developers time.
-    self._SubmitChanges(self.changes)
+    self._SubmitChanges(self.changes, check_tree_open=check_tree_open)
     if self.changes_that_failed_to_apply_earlier:
       self._HandleApplyFailure(self.changes_that_failed_to_apply_earlier)
 
@@ -1259,28 +1450,26 @@ class ValidationPool(object):
     Args:
       change: GerritPatch instance to operate upon.
     """
-    msg = 'The Commit Queue failed to apply your change in %(build_log)s .'
+    msg = '%(queue)s failed to apply your change in %(build_log)s .'
     msg += '  %(failure)s'
-    self._SendNotification(failure.patch, msg, failure=failure)
-    self._helper_pool.ForChange(failure.patch).RemoveCommitReady(
-        failure.patch, dryrun=self.dryrun)
+    self.SendNotification(failure.patch, msg, failure=failure)
+    self.RemoveCommitReady(failure.patch)
 
   def HandleValidationTimeout(self):
     """Handles changes that timed out."""
     logging.info('Validation timed out for all changes.')
     for change in self.changes:
       logging.info('Validation timed out for change %s.', change)
-      self._SendNotification(change,
-          'The Commit Queue timed out while verifying your change in '
+      self.SendNotification(change,
+          '%(queue)s timed out while verifying your change in '
           '%(build_log)s . This means that a supporting builder did not '
           'finish building your change within the specified timeout. If you '
           'believe this happened in error, just re-mark your commit as ready. '
           'Your change will then get automatically retried.')
-      self._helper_pool.ForChange(change).RemoveCommitReady(
-          change, dryrun=self.dryrun)
+      self.RemoveCommitReady(change)
 
-  def _SendNotification(self, change, msg, **kwargs):
-    d = dict(build_log=self.build_log, **kwargs)
+  def SendNotification(self, change, msg, **kwargs):
+    d = dict(build_log=self.build_log, queue=self.queue, **kwargs)
     try:
       msg %= d
     except (TypeError, ValueError), e:
@@ -1293,6 +1482,14 @@ class ValidationPool(object):
     PaladinMessage(msg, change, self._helper_pool.ForChange(change)).Send(
         self.dryrun)
 
+  def HandlePreCQSuccess(self):
+    """Handler that is called when the Pre-CQ successfully verifies a change."""
+    msg = '%(queue)s successfully verified your change in %(build_log)s .'
+    for change in self.changes:
+      if self.GetPreCQStatus(change) != self.STATUS_PASSED:
+        self.SendNotification(change, msg)
+        self.UpdatePreCQStatus(change, self.STATUS_PASSED)
+
   def _HandleCouldNotSubmit(self, change):
     """Handler that is called when Paladin can't submit a change.
 
@@ -1303,12 +1500,11 @@ class ValidationPool(object):
     Args:
       change: GerritPatch instance to operate upon.
     """
-    self._SendNotification(change,
-        'The Commit Queue failed to submit your change in %(build_log)s . '
+    self.SendNotification(change,
+        '%(queue)s failed to submit your change in %(build_log)s . '
         'This can happen if you submitted your change or someone else '
         'submitted a conflicting change while your change was being tested.')
-    self._helper_pool.ForChange(change).RemoveCommitReady(
-        change, dryrun=self.dryrun)
+    self.RemoveCommitReady(change)
 
   @staticmethod
   def _FindSuspects(changes, messages):
@@ -1375,21 +1571,35 @@ class ValidationPool(object):
     return suspects
 
   @staticmethod
-  def _CreateValidationFailureMessage(change, suspects, messages):
+  def _CreateValidationFailureMessage(pre_cq, change, suspects, messages):
     """Create a message explaining why a validation failure occurred.
 
     Args:
+      pre_cq: Whether this builder is a Pre-CQ builder.
       change: The change we want to create a message for.
       suspects: The set of suspect changes that we think broke the build.
       messages: A list of build failure messages from supporting builders.
     """
-    msg = ['The following build(s) failed:'] + map(str, messages)
+    # Build a list of error messages. We don't want to build a ridiculously
+    # long comment, as Gerrit will reject it. See http://crbug.com/236831
+    max_error_len = 20000 / max(1, len(messages))
+    msg = ['The following build(s) failed:']
+    for message in map(str, messages):
+      if len(message) > max_error_len:
+        message = message[:max_error_len] + '... (truncated)'
+      msg.append(message)
 
     # Create a list of changes other than this one that might be guilty.
+    # Limit the number of suspects to 20 so that the list of suspects isn't
+    # ridiculously long.
+    max_suspects = 20
     other_suspects = suspects - set([change])
-    other_suspects_str = ', '.join(sorted(
-        cros_patch.FormatChangeId(x.change_id, force_internal=x.internal)
-                                  for x in other_suspects))
+    if len(other_suspects) < max_suspects:
+      other_suspects_str = ', '.join(sorted(
+          'CL:%s' % x.gerrit_number_str for x in other_suspects))
+    else:
+      other_suspects_str = ('%d other changes. See the blamelist for more '
+                            'details.' % (len(other_suspects),))
 
     if change in suspects:
       if other_suspects_str:
@@ -1408,8 +1618,10 @@ class ValidationPool(object):
       else:
         msg.append('One of the following changes is probably at fault: %s'
                    % other_suspects_str)
-      msg.insert(
-          0, 'NOTE: The Commit Queue will retry your change automatically.')
+
+      if not pre_cq:
+        msg.insert(
+            0, 'NOTE: The Commit Queue will retry your change automatically.')
 
     return '\n\n'.join(msg)
 
@@ -1425,26 +1637,42 @@ class ValidationPool(object):
       messages: A list of build failure messages from supporting builders.
           These must be ValidationFailedMessage objects.
     """
+    changes = []
+    for change in self.changes:
+      # Ignore changes that were already verified.
+      if self.pre_cq and self.GetPreCQStatus(change) == self.STATUS_PASSED:
+        continue
+      changes.append(change)
 
     # First, calculate which changes are likely at fault for the failure.
-    suspects = self._FindSuspects(self.changes, messages)
+    suspects = self._FindSuspects(changes, messages)
 
     # Send out failure notifications for each change.
-    for change in self.changes:
-      msg = self._CreateValidationFailureMessage(change, suspects, messages)
-      self._SendNotification(change, '%(details)s', details=msg)
+    for change in changes:
+      msg = self._CreateValidationFailureMessage(self.pre_cq, change, suspects,
+                                                 messages)
+      self.SendNotification(change, '%(details)s', details=msg)
       if change in suspects:
-        self._helper_pool.ForChange(change).RemoveCommitReady(
-            change, dryrun=self.dryrun)
+        self.RemoveCommitReady(change)
+      if self.pre_cq:
+        # Mark the change as failed. If the Ready bit is still set, the change
+        # will be retried automatically.
+        self.UpdatePreCQStatus(change, self.STATUS_FAILED)
 
   def GetValidationFailedMessage(self):
     """Returns message indicating these changes failed to be validated."""
     logging.info('Validation failed for all changes.')
     internal = self._overlays in [constants.PRIVATE_OVERLAYS,
                                   constants.BOTH_OVERLAYS]
-    return ValidationFailedMessage(self._builder_name, self.build_log,
-                                   results_lib.Results.GetTracebacks(),
-                                   internal)
+    details = []
+    tracebacks = results_lib.Results.GetTracebacks()
+    for x in tracebacks:
+      details.append('The %s stage failed: %s' % (x.failed_stage, x.exception))
+    if not details:
+      details = ['cbuildbot failed']
+    details.append('in %s' % (self.build_log,))
+    msg = '%s: %s' % (urllib.unquote(self._builder_name), ' '.join(details))
+    return ValidationFailedMessage(msg, tracebacks, internal)
 
   def HandleCouldNotApply(self, change):
     """Handler for when Paladin fails to apply a change.
@@ -1455,7 +1683,7 @@ class ValidationPool(object):
     Args:
       change: GerritPatch instance to operate upon.
     """
-    msg = 'The Commit Queue failed to apply your change in %(build_log)s . '
+    msg = '%(queue)s failed to apply your change in %(build_log)s . '
     # This is written this way to protect against bugs in CQ itself.  We log
     # it both to the build output, and mark the change w/ it.
     extra_msg = getattr(change, 'apply_error_message', None)
@@ -1469,9 +1697,8 @@ class ValidationPool(object):
           'failing.')
 
     msg += extra_msg
-    self._SendNotification(change, msg)
-    self._helper_pool.ForChange(change).RemoveCommitReady(
-        change, dryrun=self.dryrun)
+    self.SendNotification(change, msg)
+    self.RemoveCommitReady(change)
 
   def _HandleApplySuccess(self, change):
     """Handler for when Paladin successfully applies a change.
@@ -1482,9 +1709,56 @@ class ValidationPool(object):
     Args:
       change: GerritPatch instance to operate upon.
     """
-    self._SendNotification(change,
-        'The Commit Queue has picked up your change. '
-        'You can follow along at %(build_log)s .')
+    if self.pre_cq:
+      status = self.GetPreCQStatus(change)
+      if status == self.STATUS_PASSED:
+        return
+    msg = ('%(queue)s has picked up your change. '
+           'You can follow along at %(build_log)s .')
+    self.SendNotification(change, msg)
+    if self.pre_cq and status == self.STATUS_LAUNCHING:
+      self.UpdatePreCQStatus(change, self.STATUS_INFLIGHT)
+
+  def _GetPreCQStatusURL(self, change):
+    internal = 'int' if change.internal else 'ext'
+    components = [constants.MANIFEST_VERSIONS_GS_URL, 'pre-cq',
+                  internal, change.gerrit_number, change.patch_number]
+    return '/'.join(components)
+
+  def GetPreCQStatus(self, change):
+    """Get Pre-CQ status for |change|."""
+    ctx = gs.GSContext()
+    url = self._GetPreCQStatusURL(change)
+    try:
+      return ctx.Cat(url).output
+    except gs.GSNoSuchKey:
+      logging.debug('No status yet for %r', url)
+      return None
+
+  def UpdatePreCQStatus(self, change, status):
+    """Update Google Storage URL for |change| with the Pre-CQ |status|."""
+    url = self._GetPreCQStatusURL(change)
+    ctx = gs.GSContext(dry_run=self.dryrun)
+    ctx.Copy('-', url, input=status)
+
+  def CreateDisjointTransactions(self, manifest):
+    """Create a list of disjoint transactions from the changes in the pool.
+
+    Args:
+      manifest: Manifest to use.
+
+    Returns:
+      A list of disjoint transactions. Each transaction can be tried
+      independently, without involving patches from other transactions.
+      Each change in the pool will included in exactly one of transactions,
+      unless the patch does not apply for some reason.
+    """
+    patches = PatchSeries(self.build_root, forced_manifest=manifest)
+    plans, failed = patches.CreateDisjointTransactions(self.changes)
+    failed = self._FilterDependencyErrors(failed)
+    if failed:
+      self._HandleApplyFailure(failed)
+    return plans
 
 
 class PaladinMessage():
@@ -1495,7 +1769,12 @@ class PaladinMessage():
                                 'tree-sheriffs/sheriff-details-chromium-os/'
                                 'commit-queue-overview')
 
+  # Gerrit can't handle commands over 32768 bytes. See http://crbug.com/236831
+  MAX_MESSAGE_LEN = 32000
+
   def __init__(self, message, patch, helper):
+    if len(message) > self.MAX_MESSAGE_LEN:
+      message = message[:self.MAX_MESSAGE_LEN] + '... (truncated)'
     self.message = message
     self.patch = patch
     self.helper = helper

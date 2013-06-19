@@ -18,10 +18,14 @@ build directory) and rsyncs the contents of the staging directory onto your
 device's rootfs.
 """
 
+import collections
+import contextlib
+import functools
 import logging
 import multiprocessing
 import os
 import optparse
+import shlex
 import time
 
 
@@ -35,6 +39,8 @@ from chromite.lib import gs
 from chromite.lib import osutils
 from chromite.lib import parallel
 from chromite.lib import remote_access as remote
+from chromite.lib import stats
+from chromite.scripts import lddtree
 
 
 _USAGE = "deploy_chrome [--]\n\n %s" % __doc__
@@ -49,7 +55,10 @@ MOUNT_RW_COMMAND = 'mount -o remount,rw /'
 LSOF_COMMAND = 'lsof %s/chrome'
 
 _CHROME_DIR = '/opt/google/chrome'
+_CHROME_DIR_MOUNT = '/mnt/stateful_partition/deploy_rootfs/opt/google/chrome'
 
+_BIND_TO_FINAL_DIR_CMD = 'mount --rbind %s %s'
+_SET_MOUNT_FLAGS_CMD = 'mount -o remount,exec,suid %s'
 
 def _UrlBaseName(url):
   """Return the last component of the URL."""
@@ -58,6 +67,10 @@ def _UrlBaseName(url):
 
 class DeployFailure(results_lib.StepFailure):
   """Raised whenever the deploy fails."""
+
+
+DeviceInfo = collections.namedtuple(
+    'DeviceInfo', ['target_dir_size', 'target_fs_free'])
 
 
 class DeployChrome(object):
@@ -75,6 +88,20 @@ class DeployChrome(object):
     self.staging_dir = staging_dir
     self.host = remote.RemoteAccess(options.to, tempdir, port=options.port)
     self._rootfs_is_still_readonly = multiprocessing.Event()
+
+  def _GetRemoteMountFree(self, remote_dir):
+    result = self.host.RemoteSh('df -k %s' % remote_dir)
+    line = result.output.splitlines()[1]
+    return int(line.split()[3])
+
+  def _GetRemoteDirSize(self, remote_dir):
+    result = self.host.RemoteSh('du -ks %s' % remote_dir)
+    return int(result.output.split()[0])
+
+  def _GetStagingDirSize(self):
+    result = cros_build_lib.DebugRunCommand(['du', '-ks', self.staging_dir],
+                                            redirect_stdout=True)
+    return int(result.output.split()[0])
 
   def _ChromeFileInUse(self):
     result = self.host.RemoteSh(LSOF_COMMAND % (self.options.target_dir,),
@@ -165,6 +192,30 @@ class DeployChrome(object):
     if result.returncode:
       self._rootfs_is_still_readonly.set()
 
+  def _GetDeviceInfo(self):
+    steps = [
+        functools.partial(self._GetRemoteDirSize, self.options.target_dir),
+        functools.partial(self._GetRemoteMountFree, self.options.target_dir)
+    ]
+    return_values = parallel.RunParallelSteps(steps, return_values=True)
+    return DeviceInfo(*return_values)
+
+  def _CheckDeviceFreeSpace(self, device_info):
+    """See if target device has enough space for Chrome.
+
+    Arguments:
+      device_info: A DeviceInfo named tuple.
+    """
+    effective_free = device_info.target_dir_size + device_info.target_fs_free
+    staging_size = self._GetStagingDirSize()
+    if effective_free < staging_size:
+      raise DeployFailure(
+          'Not enough free space on the device.  Required: %s MB, '
+          'actual: %s MB.' % (staging_size/1024, effective_free/1024))
+    if device_info.target_fs_free < (100 * 1024):
+      logging.warning('The device has less than 100MB free.  deploy_chrome may '
+                      'hang during the transfer.')
+
   def _Deploy(self):
     logging.info('Copying Chrome to %s on device...', self.options.target_dir)
     # Show the output (status) for this command.
@@ -187,6 +238,16 @@ class DeployChrome(object):
   def _PrepareStagingDir(self):
     _PrepareStagingDir(self.options, self.tempdir, self.staging_dir)
 
+  def _MountTarget(self):
+    logging.info('Mounting Chrome...')
+
+    # Create directory if does not exist
+    self.host.RemoteSh('mkdir -p --mode 0775 %s' % (self.options.mount_dir,))
+    self.host.RemoteSh(_BIND_TO_FINAL_DIR_CMD % (self.options.target_dir,
+                                                 self.options.mount_dir))
+    # Chrome needs partition to have exec and suid flags set
+    self.host.RemoteSh(_SET_MOUNT_FLAGS_CMD % (self.options.mount_dir,))
+
   def Perform(self):
     # If requested, just do the staging step.
     if self.options.staging_only:
@@ -195,14 +256,20 @@ class DeployChrome(object):
 
     # Run setup steps in parallel. If any step fails, RunParallelSteps will
     # stop printing output at that point, and halt any running steps.
-    steps = [self._PrepareStagingDir, self._CheckConnection,
-             self._KillProcsIfNeeded, self._MountRootfsAsWritable]
-    parallel.RunParallelSteps(steps, halt_on_error=True)
+    steps = [self._GetDeviceInfo, self._PrepareStagingDir,
+             self._CheckConnection, self._KillProcsIfNeeded,
+             self._MountRootfsAsWritable]
+    ret = parallel.RunParallelSteps(steps, halt_on_error=True,
+                                    return_values=True)
+    self._CheckDeviceFreeSpace(ret[0])
 
     # If we failed to mark the rootfs as writable, try disabling rootfs
     # verification.
     if self._rootfs_is_still_readonly.is_set():
       self._DisableRootfsVerification()
+
+    if self.options.mount_dir is not None:
+      self._MountTarget()
 
     # Actually deploy Chrome to the device.
     self._Deploy()
@@ -243,34 +310,52 @@ def _CreateParser():
                          'environment variable must be set.')
   parser.add_option('--target-dir', type='path',
                     help='Target directory on device to deploy Chrome into.',
-                    default=_CHROME_DIR)
+                    default=None)
   parser.add_option('-g', '--gs-path', type='gs_path',
                     help='GS path that contains the chrome to deploy.')
   parser.add_option('--nostartui', action='store_false', dest='startui',
                     default=True,
                     help="Don't restart the ui daemon after deployment.")
+  parser.add_option('--nostrip', action='store_false', dest='dostrip',
+                    default=True,
+                    help="Don't strip binaries during deployment.  Warning: "
+                         "the resulting binaries will be very large!")
   parser.add_option('-p', '--port', type=int, default=remote.DEFAULT_SSH_PORT,
                     help='Port of the target device to connect to.')
   parser.add_option('-t', '--to',
                     help='The IP address of the CrOS device to deploy to.')
   parser.add_option('-v', '--verbose', action='store_true', default=False,
                     help='Show more debug output.')
+  parser.add_option('--mount-dir', type='path', default=None,
+                    help='Deploy Chrome in target directory and bind it'
+                         'to directory specified by this flag.')
+  parser.add_option('--mount', action='store_true', default=False,
+                    help='Deploy Chrome to default target directory and bind it'
+                         'to default mount directory.')
 
   group = optparse.OptionGroup(parser, 'Advanced Options')
   group.add_option('-l', '--local-pkg-path', type='path',
                    help='Path to local chrome prebuilt package to deploy.')
   group.add_option('--sloppy', action='store_true', default=False,
                    help='Ignore when mandatory artifacts are missing.')
+  group.add_option('--staging-flags', default=None, type='gyp_defines',
+                   help='Extra flags to control staging.  Valid flags are - %s'
+                        % ', '.join(chrome_util.STAGING_FLAGS))
   group.add_option('--strict', action='store_true', default=False,
                    help='Stage artifacts based on the GYP_DEFINES environment '
                         'variable and --staging-flags, if set. Enforce that '
                         'all optional artifacts are deployed.')
-  group.add_option('--staging-flags', default=None, type='gyp_defines',
-                   help='Extra flags to control staging.  Valid flags are - %s'
-                        % ', '.join(chrome_util.STAGING_FLAGS))
+  group.add_option('--strip-flags', default=None,
+                   help="Flags to call the 'strip' binutil tool with.  "
+                        "Overrides the default arguments.")
 
   parser.add_option_group(group)
 
+  # GYP_DEFINES that Chrome was built with.  Influences which files are staged
+  # when --build-dir is set.  Defaults to reading from the GYP_DEFINES
+  # enviroment variable.
+  parser.add_option('--gyp-defines', default=None, type='gyp_defines',
+                    help=optparse.SUPPRESS_HELP)
   # Path of an empty directory to stage chrome artifacts to.  Defaults to a
   # temporary directory that is removed when the script finishes. If the path
   # is specified, then it will not be removed.
@@ -279,11 +364,10 @@ def _CreateParser():
   # Only prepare the staging directory, and skip deploying to the device.
   parser.add_option('--staging-only', action='store_true', default=False,
                     help=optparse.SUPPRESS_HELP)
-  # GYP_DEFINES that Chrome was built with.  Influences which files are staged
-  # when --build-dir is set.  Defaults to reading from the GYP_DEFINES
-  # enviroment variable.
-  parser.add_option('--gyp-defines', default=None, type='gyp_defines',
-                    help=optparse.SUPPRESS_HELP)
+  # Path to a binutil 'strip' tool to strip binaries with.  The passed-in path
+  # is used as-is, and not normalized.  Used by the Chrome ebuild to skip
+  # fetching the SDK toolchain.
+  parser.add_option('--strip-bin', default=None, help=optparse.SUPPRESS_HELP)
   return parser
 
 
@@ -311,6 +395,17 @@ def _ParseCommandLine(argv):
     parser.error('--staging-flags requires --strict to be set.')
   if options.sloppy and options.strict:
     parser.error('Cannot specify both --strict and --sloppy.')
+
+  if options.mount or options.mount_dir:
+    if not options.target_dir:
+      options.target_dir = _CHROME_DIR_MOUNT
+  else:
+    if not options.target_dir:
+      options.target_dir = _CHROME_DIR
+
+  if options.mount and not options.mount_dir:
+    options.mount_dir = _CHROME_DIR
+
   return options, args
 
 
@@ -323,15 +418,26 @@ def _PostParseCheck(options, _args):
   if options.local_pkg_path and not os.path.isfile(options.local_pkg_path):
     cros_build_lib.Die('%s is not a file.', options.local_pkg_path)
 
-  if options.strict and not options.gyp_defines:
+  if not options.gyp_defines:
     gyp_env = os.getenv('GYP_DEFINES', None)
     if gyp_env is not None:
       options.gyp_defines = chrome_util.ProcessGypDefines(gyp_env)
-      logging.info('GYP_DEFINES taken from environment: %s',
+      logging.debug('GYP_DEFINES taken from environment: %s',
                    options.gyp_defines)
-    else:
-      cros_build_lib.Die('When --strict is set, the GYP_DEFINES environment '
+
+  if options.strict and not options.gyp_defines:
+    cros_build_lib.Die('When --strict is set, the GYP_DEFINES environment '
                          'variable must be set.')
+
+  if options.build_dir:
+    chrome_path = os.path.join(options.build_dir, 'chrome')
+    if os.path.isfile(chrome_path):
+      deps = lddtree.ParseELF(chrome_path)
+      if 'libbase.so' in deps['libs']:
+        cros_build_lib.Warning(
+            'Detected a component build of Chrome.  component build is '
+            'not working properly for Chrome OS.  See crbug.com/196317.  '
+            'Use at your own risk!')
 
 
 def _FetchChromePackage(cache_dir, tempdir, gs_path):
@@ -365,14 +471,13 @@ def _FetchChromePackage(cache_dir, tempdir, gs_path):
   return chrome_path
 
 
-def _PrepareStagingDir(options, tempdir, staging_dir):
-  """Place the necessary files in the staging directory.
-
-  The staging directory is the directory used to rsync the build artifacts over
-  to the device.  Only the necessary Chrome build artifacts are put into the
-  staging directory.
-  """
-  if options.build_dir:
+@contextlib.contextmanager
+def _StripBinContext(options):
+  if not options.dostrip:
+    yield None
+  elif options.strip_bin:
+    yield options.strip_bin
+  else:
     sdk = cros_chrome_sdk.SDKFetcher(options.cache_dir, options.board)
     components = (sdk.TARGET_TOOLCHAIN_KEY, constants.CHROME_ENV_TAR)
     with sdk.Prepare(components=components) as ctx:
@@ -381,10 +486,27 @@ def _PrepareStagingDir(options, tempdir, staging_dir):
       strip_bin = osutils.SourceEnvironment(env_path, ['STRIP'])['STRIP']
       strip_bin = os.path.join(ctx.key_map[sdk.TARGET_TOOLCHAIN_KEY].path,
                                'bin', os.path.basename(strip_bin))
+      yield strip_bin
+
+
+def _PrepareStagingDir(options, tempdir, staging_dir):
+  """Place the necessary files in the staging directory.
+
+  The staging directory is the directory used to rsync the build artifacts over
+  to the device.  Only the necessary Chrome build artifacts are put into the
+  staging directory.
+  """
+  osutils.SafeMakedirs(staging_dir)
+  os.chmod(staging_dir, 0755)
+  if options.build_dir:
+    with _StripBinContext(options) as strip_bin:
+      strip_flags = (None if options.strip_flags is None else
+                     shlex.split(options.strip_flags))
       chrome_util.StageChromeFromBuildDir(
           staging_dir, options.build_dir, strip_bin, strict=options.strict,
           sloppy=options.sloppy, gyp_defines=options.gyp_defines,
-          staging_flags=options.staging_flags)
+          staging_flags=options.staging_flags,
+          strip_flags=strip_flags)
   else:
     pkg_path = options.local_pkg_path
     if options.gs_path:
@@ -393,8 +515,12 @@ def _PrepareStagingDir(options, tempdir, staging_dir):
 
     assert pkg_path
     logging.info('Extracting %s...', pkg_path)
-    osutils.SafeMakedirs(staging_dir)
-    cros_build_lib.DebugRunCommand(['tar', '-xpf', pkg_path], cwd=staging_dir)
+    # Extract only the ./opt/google/chrome contents, directly into the staging
+    # dir, collapsing the directory hierarchy.
+    cros_build_lib.DebugRunCommand(
+        ['tar', '--strip-components', '4', '--extract',
+         '--preserve-permissions', '--file', pkg_path, '.%s' % _CHROME_DIR],
+        cwd=staging_dir)
 
 
 def main(argv):
@@ -407,13 +533,18 @@ def main(argv):
   else:
     logging.getLogger().setLevel(logging.INFO)
 
-  with osutils.TempDirContextManager() as tempdir:
-    staging_dir = options.staging_dir
-    if not staging_dir:
-      staging_dir = os.path.join(tempdir, 'chrome')
+  with stats.UploadContext() as queue:
+    cmd_stats = stats.Stats.SafeInit(cmd_line=argv, cmd_base='deploy_chrome')
+    if cmd_stats:
+      queue.put([cmd_stats, stats.StatsUploader.URL, 1])
 
-    deploy = DeployChrome(options, tempdir, staging_dir)
-    try:
-      deploy.Perform()
-    except results_lib.StepFailure as ex:
-      raise SystemExit(str(ex).strip())
+    with osutils.TempDir(set_global=True) as tempdir:
+      staging_dir = options.staging_dir
+      if not staging_dir:
+        staging_dir = os.path.join(tempdir, 'chrome')
+
+      deploy = DeployChrome(options, tempdir, staging_dir)
+      try:
+        deploy.Perform()
+      except results_lib.StepFailure as ex:
+        raise SystemExit(str(ex).strip())

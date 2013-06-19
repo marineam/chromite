@@ -392,7 +392,7 @@ def RunCommand(cmd, print_cmd=True, error_ok=False, error_message=None,
       logger.log(debug_level, 'RunCommand: %s in %s',
                  ' '.join(map(repr, cmd)), cwd)
     else:
-      logger.log(debug_level, 'RunCommand: %r', ' '.join(map(repr, cmd)))
+      logger.log(debug_level, 'RunCommand: %s', ' '.join(map(repr, cmd)))
 
   cmd_result.cmd = cmd
 
@@ -451,7 +451,8 @@ def RunCommand(cmd, print_cmd=True, error_ok=False, error_message=None,
                      "with args=%r", cmd)
 
     if not error_ok and not error_code_ok and proc.returncode:
-      msg = 'Failed command "%r", cwd=%s, extra env=%r' % (cmd, cwd, extra_env)
+      msg = ('Failed command "%s", cwd=%s, extra env=%r'
+             % (' '.join(map(repr, cmd)), cwd, extra_env))
       if error_message:
         msg += '\n%s' % error_message
       raise RunCommandError(msg, cmd_result)
@@ -478,8 +479,15 @@ def RunCommand(cmd, print_cmd=True, error_ok=False, error_message=None,
   return cmd_result
 
 
-# Convenience RunCommand methods
-DebugRunCommand = functools.partial(RunCommand, debug_level=logging.DEBUG)
+# Convenience RunCommand methods.
+#
+# We don't use functools.partial because it binds the methods at import time,
+# which doesn't work well with unit tests, since it bypasses the mock that may
+# be set up for RunCommand.
+
+def DebugRunCommand(*args, **kwargs):
+  kwargs.setdefault('debug_level', logging.DEBUG)
+  return RunCommand(*args, **kwargs)
 
 
 class DieSystemExit(SystemExit):
@@ -589,7 +597,7 @@ def GetChromeosVersion(str_obj):
       chromeos_version.sh. Or None if not found.
   """
   if str_obj is not None:
-    match = re.search('CHROMEOS_VERSION_STRING=([0-9_.]+)', str_obj)
+    match = re.search(r'CHROMEOS_VERSION_STRING=([0-9_.]+)', str_obj)
     if match and match.group(1):
       Info ('CHROMEOS_VERSION_STRING = %s' % match.group(1))
       return match.group(1)
@@ -609,39 +617,27 @@ def GetHostName(fully_qualified=False):
 
 
 def GetHostDomain():
-  """Return domain of current machine, or None if there is no domain."""
+  """Return domain of current machine.
+
+  If there is no domain, return 'localdomain'.
+  """
+
   hostname = GetHostName(fully_qualified=True)
   domain = hostname.partition('.')[2]
-  return domain if domain else None
+  return domain if domain else 'localdomain'
 
 
-class RetriesExhausted(Exception):
-  "Exception thrown when all retry attempts are exhausted and no error occured"
-
-
-def RetryInvocation(return_handler, exc_handler, max_retry, functor, *args,
-                    **kwds):
+def GenericRetry(handler, max_retry, functor, *args, **kwds):
   """Generic retry loop w/ optional break out depending on exceptions.
 
-  Generally speaking you likely want RetryException or RetryReturned
-  rather than this; they're wrappers around this and are friendlier for
-  end usage.
-
-  Arguments:
-    return_handler: A functor invoked with the returned results from
-      functor(*args, **kwds).  If it returns True, then a retry
-      is attempted.  If False, the result is returned.
-      If this value is None, then no retries are attempted for
-      non-excepting invocations of functor(*args, **kwds) .
-    exc_handler: A functor invoked w/ the exception instance that
+  Args:
+    handler: A functor invoked w/ the exception instance that
       functor(*args, **kwds) threw.  If it returns True, then a
       retry is attempted.  If False, the exception is re-raised.
-      If this value is None, then no exception based retries will
-      occur.
     max_retry: A positive integer representing how many times to retry
       the command before giving up.  Worst case, the command is invoked
       (max_retry + 1) times before failing.
-    functor: A callable to pass args and kargs to.
+    functor: A callable to pass args and kwds to.
     args: Positional args passed to functor.
     kwds: Optional args passed to functor.
     sleep: Optional keyword.  Multiplier for how long to sleep between
@@ -650,75 +646,32 @@ def RetryInvocation(return_handler, exc_handler, max_retry, functor, *args,
   Returns:
     Whatever functor(*args, **kwds) returns.
   Raises:
-    Exception:  Whatever exceptions functor(*args, **kwds) throws and
+    Exception: Whatever exceptions functor(*args, **kwds) throws and
       isn't suppressed is raised.  Note that the first exception encountered
-      is what's thrown; in the absense of an exception (meaning ran out
-      of retries based on testing the result), a generic RetriesExhausted
-      exception is thrown.
+      is what's thrown.
   """
 
-  if max_retry < 0:
-    raise ValueError("max_retry needs to be zero or more: %s" % max_retry)
   sleep = kwds.pop('sleep', 0)
-
-  stopper = lambda x: False
-  return_handler = stopper if return_handler is None else return_handler
-  exc_handler = stopper if exc_handler is None else exc_handler
+  if max_retry < 0:
+    raise ValueError('max_retry needs to be zero or more: %s' % max_retry)
 
   exc_info = None
   for attempt in xrange(max_retry + 1):
     if attempt and sleep:
       time.sleep(sleep * attempt)
     try:
-      ret = functor(*args, **kwds)
-      if not return_handler(ret):
-        return ret
-    except Exception, e:
+      return functor(*args, **kwds)
+    except Exception as e:
       # Note we're not snagging BaseException, so MemoryError/KeyboardInterrupt
       # and friends don't enter this except block.
-      if not exc_handler(e):
+      if not handler(e):
         raise
       # We intentionally ignore any failures in later attempts since we'll
       # throw the original failure if all retries fail.
       if exc_info is None:
         exc_info = sys.exc_info()
 
-  #pylint: disable=E0702
-  if exc_info is None:
-    raise RetriesExhausted(max_retry, functor, args, kwds)
   raise exc_info[0], exc_info[1], exc_info[2]
-
-
-def RetryReturned(ret_retry, max_retry, functor, *args, **kwds):
-  """Convience wrapper for RetryInvocation based on the returned value.
-
-  Specifically:
-  return RetryInvocation(ret_retry, None, max_retry, functor, *args, **kwds)
-
-  For details of arguments, exceptions, etc, see RetryInvocation.
-  """
-  return RetryInvocation(ret_retry, None, max_retry, functor, *args, **kwds)
-
-
-def RetryException(exc_retry, max_retry, functor, *args, **kwds):
-  """Convience wrapper for RetryInvocation base on exceptions.
-
-  Specifically:
-  return RetryInvocation(None, exc_retry, max_retry, functor, *args, **kwds)
-
-  Args:
-    exc_retry: Either a class (or tuple of classes), or a callable
-      that is given the raised exception.  If the raise exception
-      is the given class(es) or exc_retry(exc) results in True, a
-      retry will be attempted.  If False for either, the exception is
-      raised.
-    *: See RetryInvocation.
-  """
-  if isinstance(exc_retry, (tuple, type)):
-    #pylint: disable=E0102
-    def exc_retry(exc, values=exc_retry):
-      return isinstance(exc, values)
-  return RetryInvocation(None, exc_retry, max_retry, functor, *args, **kwds)
 
 
 def RetryCommand(functor, max_retry, *args, **kwds):
@@ -733,21 +686,27 @@ def RetryCommand(functor, max_retry, *args, **kwds):
     sleep: Optional keyword.  Multiplier for how long to sleep between
       retries; will delay (1*sleep) the first time, then (2*sleep),
       continuing via attempt * sleep.
-    retry_on: If given, it must support containment (ie, lists, sets, etc),
-      and retry will only be continued for the given exit codes,
-      failing immediately if the exit code isn't one of the allowed
-      retry codes.
+    retry_on: If provided, we will retry on any exit codes in the given list.
+      Note: A process will exit with a negative exit code if it is killed by a
+      signal. By default, we retry on all non-negative exit codes.
     args: Positional args passed to RunCommand; see RunCommand for specifics.
     kwds: Optional args passed to RunCommand; see RunCommand for specifics.
   Returns:
-    A RunCommandResult object.
+    A CommandResult object.
   Raises:
     Exception:  Raises RunCommandError on error with optional error_message.
   """
-  values = kwds.pop('retry_on', set(xrange(255)))
-  def do_retry(exc):
-    return isinstance(exc, RunCommandError) and exc.result.returncode in values
-  return RetryException(do_retry, max_retry, functor, *args, **kwds)
+  values = kwds.pop('retry_on', None)
+  def ShouldRetry(exc):
+    """Return whether we should retry on a given exception."""
+    if not isinstance(exc, RunCommandError):
+      return False
+    if values is None and exc.result.returncode < 0:
+      logging.info('Child process received signal %d; not retrying.',
+                   -exc.result.returncode)
+      return False
+    return values is None or exc.result.returncode in values
+  return GenericRetry(ShouldRetry, max_retry, functor, *args, **kwds)
 
 
 def RunCommandWithRetries(max_retry, *args, **kwds):
@@ -756,7 +715,7 @@ def RunCommandWithRetries(max_retry, *args, **kwds):
   Arguments:
     See RetryCommand and RunCommand; This is just a wrapper around it.
   Returns:
-    A RunCommandResult object.
+    A CommandResult object.
   Raises:
     Exception:  Raises RunCommandError on error with optional error_message.
   """
@@ -794,7 +753,7 @@ def TimedCommand(functor, *args, **kwargs):
                    the time delta details.
   """
   log_msg = kwargs.pop('timed_log_msg', '%s(*%r, **%r) took: %%s'
-                         % (functor.__name__, args, kwargs))
+                       % (functor.__name__, args, kwargs))
   log_level = kwargs.pop('timed_log_level', logging.INFO)
   start = datetime.now()
   ret = functor(*args, **kwargs)
@@ -923,6 +882,46 @@ def BooleanPrompt(prompt="Do you want to continue?", default=True,
       return False
 
 
+def BooleanShellValue(sval, default, msg=None):
+  """See if the string value is a value users typically consider as boolean
+
+  Often times people set shell variables to different values to mean "true"
+  or "false".  For example, they can do:
+    export FOO=yes
+    export BLAH=1
+    export MOO=true
+  Handle all that user ugliness here.
+
+  If the user picks an invalid value, you can use |msg| to display a non-fatal
+  warning rather than raising an exception.
+
+  Args:
+    sval: The string value we got from the user.
+    default: If we can't figure out if the value is true or false, use this.
+    msg: If |sval| is an unknown value, use |msg| to warn the user that we
+         could not decode the input.  Otherwise, raise ValueError().
+  Raises:
+    ValueError() if |sval| is an unknown value and |msg| is not set.
+  Return:
+    The interpreted boolean value of |sval|.
+  """
+  if sval is None:
+    return default
+
+  if isinstance(sval, basestring):
+    s = sval.lower()
+    if s in ('yes', 'y', '1', 'true'):
+      return True
+    elif s in ('no', 'n', '0', 'false'):
+      return False
+
+  if msg is not None:
+    Warning('%s: %r' % (msg, sval))
+    return default
+  else:
+    raise ValueError('could not decode as a boolean value: %r' % sval)
+
+
 # Suppress whacked complaints about abstract class being unused.
 #pylint: disable=R0921
 class MasterPidContextManager(object):
@@ -935,8 +934,7 @@ class MasterPidContextManager(object):
   # In certain cases we actually want this ran outside
   # of the main pid- specifically in backup processes
   # doing cleanup.
-
-  _ALTERNATE_MASTER_PID = None
+  ALTERNATE_MASTER_PID = None
 
   def __init__(self):
     self._invoking_pid = None
@@ -947,7 +945,7 @@ class MasterPidContextManager(object):
 
   def __exit__(self, exc_type, exc, traceback):
     curpid = os.getpid()
-    if curpid == self._ALTERNATE_MASTER_PID:
+    if curpid == self.ALTERNATE_MASTER_PID:
       self._invoking_pid = curpid
     if curpid == self._invoking_pid:
       return self._exit(exc_type, exc, traceback)
@@ -1225,11 +1223,11 @@ def RunCurl(args, **kwargs):
         Die("Curl failed w/ exit code %i", code)
 
 
-def SetupBasicLogging():
+def SetupBasicLogging(level=logging.DEBUG):
   """Sets up basic logging to use format from constants."""
   logging_format = '%(asctime)s - %(filename)s - %(levelname)-8s: %(message)s'
   date_format = constants.LOGGER_DATE_FMT
-  logging.basicConfig(level=logging.DEBUG, format=logging_format,
+  logging.basicConfig(level=level, format=logging_format,
                       datefmt=date_format)
 
 
@@ -1437,7 +1435,8 @@ def LoadKeyValueFile(input, ignore_missing=False):
           continue
         chunks = line.split('=', 1)
         if len(chunks) != 2:
-          raise ValueError('Malformed version file; line %r' % raw_line)
+          raise ValueError('Malformed version file %r; line %r'
+                           % (input, raw_line))
         val = chunks[1].strip()
         if len(val) > 1 and val[0] in "\"'" and val[0] == val[-1]:
           # Only strip quotes if the first & last one match.
@@ -1448,6 +1447,36 @@ def LoadKeyValueFile(input, ignore_missing=False):
       raise
 
   return d
+
+
+def MemoizedSingleCall(functor):
+  """Decorator for simple functor targets, caching the results
+
+  The functor must accept no arguments beyond either a class or self (depending
+  on if this is used in a classmethod/instancemethod context).  Results of the
+  wrapped method will be written to the class/instance namespace in a specially
+  named cached value.  All future invocations will just reuse that value.
+
+  Note that this cache is per-process, so sibling and parent processes won't
+  notice updates to the cache.
+  """
+  # TODO(build): Should we rebase to snakeoil.klass.cached* functionality?
+  def f(obj):
+    # pylint: disable=W0212
+    key = f._cache_key
+    val = getattr(obj, key, None)
+    if val is None:
+      val = functor(obj)
+      setattr(obj, key, val)
+    return val
+
+  # Dummy up our wrapper to make it look like what we're wrapping,
+  # and expose the underlying docstrings.
+  f.__name__ = functor.__name__
+  f.__module__ = functor.__module__
+  f.__doc__ = functor.__doc__
+  f._cache_key = '_%s_cached' % (functor.__name__.lstrip('_'),)
+  return f
 
 
 def SafeRun(functors, combine_exceptions=False):
@@ -1493,10 +1522,12 @@ def UserDateTimeFormat(timeval=None):
   use the RFC 2822 date format (with timezone name appended).
 
   Arguments:
-    timeval: Floating point time value as accepted by gmtime()/localtime(),
-             otherwise the current time is used.
+    timeval: Either a datetime object or a floating point time value as accepted
+             by gmtime()/localtime().  If None, the current time is used.
   Returns:
     A string format such as 'Wed, 20 Feb 2013 15:25:15 -0500 (EST)'
   """
+  if isinstance(timeval, datetime):
+    timeval = time.mktime(timeval.timetuple())
   return '%s (%s)' % (formatdate(timeval=timeval, localtime=True),
                       time.tzname[0])

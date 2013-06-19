@@ -1,4 +1,4 @@
-#!/usr/bin/python2.6
+#!/usr/bin/python
 # Copyright (c) 2011 The Chromium OS Authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
@@ -109,7 +109,7 @@ def MergeTables(tables):
       # Merge users by taking the superset.
       return MergeToSuperset(col, val, other_val)
 
-    regexp = utable.UpgradeTable.COL_UPGRADED.replace('ARCH', '\S+')
+    regexp = utable.UpgradeTable.COL_UPGRADED.replace('ARCH', r'\S+')
     if re.search(regexp, col):
       return MergeWithAND(col, val, other_val)
 

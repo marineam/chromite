@@ -15,6 +15,7 @@ from chromite.buildbot import cbuildbot_commands as commands
 from chromite.buildbot import cbuildbot_results as results_lib
 from chromite.lib import cros_build_lib_unittest
 from chromite.lib import cros_test_lib
+from chromite.lib import gs
 from chromite.lib import git
 from chromite.lib import osutils
 from chromite.lib import partial_mock
@@ -54,7 +55,7 @@ class RunBuildScriptTest(cros_test_lib.TempDirTestCase):
       m.AddCmdResult(cmd, returncode=returncode, side_effect=WriteError)
       with mock.patch.object(git, 'ReinterpretPathForChroot',
                              side_effect=lambda x: x):
-        with cros_test_lib.DisableLogging():
+        with cros_test_lib.LoggingCapturer():
           # If the script failed, the exception should be raised and printed.
           if raises:
             self.assertRaises(raises, commands._RunBuildScript, buildroot,
@@ -123,6 +124,23 @@ class RunTestSuiteTest(cros_build_lib_unittest.RunCommandTempDirTestCase):
     self.assertCommandContains(['--quick', '--only_verify'])
 
 
+class ChromeSDKTest(cros_build_lib_unittest.RunCommandTempDirTestCase):
+  """Basic tests for ChromeSDK commands with RunCommand mocked out."""
+  BOARD = 'daisy_foo'
+  CMD = ['bar', 'baz']
+  CWD = 'fooey'
+
+  def testRunCommand(self):
+    """Test that running a command is possible."""
+    commands.ChromeSDK.Run(self.CWD, self.BOARD, self.CMD)
+    self.assertCommandContains([self.BOARD] + self.CMD, cwd=self.CWD)
+
+  def testNinja(self):
+    """Test that running ninja is possible."""
+    commands.ChromeSDK.Ninja(self.CWD, self.BOARD)
+    self.assertCommandContains([self.BOARD], cwd=self.CWD)
+
+
 class CBuildBotTest(cros_build_lib_unittest.RunCommandTempDirTestCase):
 
   def setUp(self):
@@ -136,12 +154,12 @@ class CBuildBotTest(cros_build_lib_unittest.RunCommandTempDirTestCase):
     """Test if we can generate stack traces for minidumps."""
     os.makedirs(os.path.join(self._chroot, 'tmp'))
     dump_file = os.path.join(self._chroot, 'tmp', 'test.dmp')
-    tarfile = os.path.join(self.tempdir, 'test_results.tar')
+    tarfile = os.path.join(self.tempdir, 'vm_test_results.tar')
     osutils.Touch(tarfile)
     dump_file_dir, dump_file_name = os.path.split(dump_file)
     ret = [(dump_file_dir, [''], [dump_file_name])]
     with mock.patch('os.walk', return_value=ret):
-      gzipped_test_tarball = os.path.join(self.tempdir, 'test_results.tgz')
+      gzipped_test_tarball = os.path.join(self.tempdir, 'vm_test_results.tgz')
       commands.GenerateStackTraces(self._buildroot, self._board,
                                    gzipped_test_tarball, self.tempdir, True)
       self.assertCommandContains([gzipped_test_tarball])
@@ -239,7 +257,7 @@ ca-t3/pk-g4-4.0.1-r333
     """Base case where Build is called with minimal options."""
     kwds.setdefault('build_autotest', default)
     kwds.setdefault('usepkg', default)
-    kwds.setdefault('skip_toolchain_update', default)
+    kwds.setdefault('skip_chroot_upgrade', default)
     kwds.setdefault('nowithdebug', default)
     commands.Build(buildroot=self._buildroot, board='x86-generic', **kwds)
     self.assertCommandContains(['./build_packages'])
@@ -278,6 +296,13 @@ ca-t3/pk-g4-4.0.1-r333
     commands.BuildImage(self._buildroot, self._board, None)
     self.assertCommandContains(['./build_image'])
 
+  def testGenerateAuZip(self):
+    """Test Basic generate_au_zip Command."""
+    with mock.patch.object(git, 'ReinterpretPathForChroot',
+                           side_effect=lambda x: x):
+      commands.GenerateAuZip(self._buildroot, '/tmp/taco', None)
+    self.assertCommandContains(['./build_library/generate_au_zip.py'])
+
   def testCompleteBuildImage(self):
     """Test Complete BuildImage Command."""
     images_to_build = ['bob', 'carol', 'ted', 'alice']
@@ -305,6 +330,46 @@ ca-t3/pk-g4-4.0.1-r333
     """Verifies that we can get the chrome lkgm with a chrome revision."""
     self._TestChromeLKGM(1234)
     self.assertCommandContains(['svn', 'cat', '-r', '1234'])
+
+  def testAbortHWTests(self):
+    commands.AbortHWTests('my-version', debug=False)
+    self.assertCommandContains(['cp', '-'], input='')
+    self.assertCommandContains(['-i', 'my-version'])
+
+  def testHWTestsAborted(self, aborted=True):
+    self.PatchObject(gs.GSContext, 'Exists', return_value=aborted)
+    self.assertEqual(commands.HaveHWTestsBeenAborted('my-version'), aborted)
+
+  def testHWTestsNotAborted(self):
+    self.testHWTestsAborted(aborted=False)
+
+
+class BuildTarballTests(cros_build_lib_unittest.RunCommandTempDirTestCase):
+
+  def setUp(self):
+    self._buildroot = os.path.join(self.tempdir, 'buildroot')
+    os.makedirs(self._buildroot)
+    self._board = 'test-board'
+
+  def testBuildAUTestTarball(self):
+    """Tests that our call to generate an au test tarball is correct."""
+    tarball_dir = self.tempdir
+    archive_url = 'gs://mytest/path/version'
+    with mock.patch.object(commands, 'BuildTarball') as m:
+      tarball_path = commands.BuildAUTestTarball(
+          self._buildroot, self._board, tarball_dir, 'R26-3928.0.0',
+          archive_url)
+      m.assert_called_once_with(self._buildroot, ['autotest/au_control_files'],
+                                os.path.join(tarball_dir, 'au_control.tar.bz2'),
+                                cwd=tarball_dir)
+
+      self.assertEquals(os.path.join(tarball_dir, 'au_control.tar.bz2'),
+                        tarball_path)
+
+    # Full release test with partial args defined.
+    self.assertCommandContains(['site_utils/autoupdate/full_release_test.py',
+                                '--archive_url', archive_url, '3928.0.0',
+                                self._board])
 
 
 class UnmockedTests(cros_test_lib.TempDirTestCase):
@@ -351,5 +416,63 @@ class UnmockedTests(cros_test_lib.TempDirTestCase):
     # Verify the tarball contents.
     cros_test_lib.VerifyTarball(tarball, fw_archived_files)
 
+  def testGenerateHtmlIndexTuple(self):
+    """Verifies GenerateHtmlIndex gives us something sane (input: tuple)"""
+    index = os.path.join(self.tempdir, 'index.html')
+    files = ('file1', 'monkey tree', 'flying phone',)
+    commands.GenerateHtmlIndex(index, files)
+    html = osutils.ReadFile(index)
+    for f in files:
+      # TODO(build): Use assertIn w/python-2.7.
+      self.assertTrue('>%s</a>' % f in html)
+
+  def testGenerateHtmlIndexTupleDupe(self):
+    """Verifies GenerateHtmlIndex gives us something unique (input: tuple)"""
+    index = os.path.join(self.tempdir, 'index.html')
+    files = ('file1', 'file1', 'file1',)
+    commands.GenerateHtmlIndex(index, files)
+    html = osutils.ReadFile(index)
+    self.assertEqual(html.count('>file1</a>'), 1)
+
+  def testGenerateHtmlIndexTuplePretty(self):
+    """Verifies GenerateHtmlIndex gives us something pretty (input: tuple)"""
+    index = os.path.join(self.tempdir, 'index.html')
+    files = ('..|up', 'f.txt|MY FILE', 'm.log|MONKEY', 'b.bin|Yander',)
+    commands.GenerateHtmlIndex(index, files)
+    html = osutils.ReadFile(index)
+    osutils.WriteFile('/tmp/foo.html', html)
+    for f in files:
+      a = f.split('|')
+      # TODO(build): Use assertIn w/python-2.7.
+      self.assertTrue('href="%s"' % a[0] in html)
+      self.assertTrue('>%s</a>' % a[1] in html)
+
+  def testGenerateHtmlIndexDir(self):
+    """Verifies GenerateHtmlIndex gives us something sane (input: dir)"""
+    index = os.path.join(self.tempdir, 'index.html')
+    files = ('a', 'b b b', 'c', 'dalsdkjfasdlkf',)
+    simple_dir = os.path.join(self.tempdir, 'dir')
+    for f in files:
+      osutils.Touch(os.path.join(simple_dir, f), makedirs=True)
+    commands.GenerateHtmlIndex(index, files)
+    html = osutils.ReadFile(index)
+    for f in files:
+      # TODO(build): Use assertIn w/python-2.7.
+      self.assertTrue('>%s</a>' % f in html)
+
+  def testGenerateHtmlIndexFile(self):
+    """Verifies GenerateHtmlIndex gives us something sane (input: file)"""
+    index = os.path.join(self.tempdir, 'index.html')
+    files = ('a.tgz', 'b b b.txt', 'c', 'dalsdkjfasdlkf',)
+    filelist = os.path.join(self.tempdir, 'listing')
+    osutils.WriteFile(filelist, '\n'.join(files))
+    commands.GenerateHtmlIndex(index, filelist)
+    html = osutils.ReadFile(index)
+    for f in files:
+      # TODO(build): Use assertIn w/python-2.7.
+      self.assertTrue('>%s</a>' % f in html)
+
+
 if __name__ == '__main__':
+  gs.GSUTIL_BIN = '/fake/path/to/gsutil'
   cros_test_lib.main()

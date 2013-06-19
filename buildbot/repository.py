@@ -27,37 +27,9 @@ class SrcCheckOutException(Exception):
   pass
 
 
-def InARepoRepository(directory, require_project=False):
-  """Returns True if directory is part of a repo checkout.
-
-  Args:
-    directory: Path to check.
-    require_project: Whether to require that directory is inside a valid
-     project in the repo root.
-  """
-  directory = os.path.abspath(directory)
-  while not os.path.isdir(directory):
-    directory = os.path.dirname(directory)
-
-  if require_project:
-    cmd = ['repo', 'forall', '.', '-c', 'true']
-  else:
-    cmd = ['repo']
-
-  output = cros_build_lib.RunCommand(
-      cmd, error_code_ok=True, redirect_stdout=True, redirect_stderr=True,
-      cwd=directory, print_cmd=False)
-  return output.returncode == 0
-
-
 def IsARepoRoot(directory):
   """Returns True if directory is the root of a repo checkout."""
-  # Check for the underlying git-repo checkout.  If it exists, it's
-  # definitely the repo root.  If it doesn't, it may be an aborted
-  # checkout- either way it isn't usable.
-  repo_dir = os.path.join(directory, '.repo')
-  return (os.path.isdir(os.path.join(repo_dir, 'repo')) and
-          os.path.isdir(os.path.join(repo_dir, 'manifests')))
+  return os.path.exists(os.path.join(directory, '.repo'))
 
 
 def IsInternalRepoCheckout(root):
@@ -147,7 +119,6 @@ class RepoRepository(object):
     depth: Mutually exclusive option to referenced_repo; this limits the
       checkout to a max commit history of the given integer.
   """
-  DEFAULT_MANIFEST = 'default'
   # Use our own repo, in case android.kernel.org (the default location) is down.
   _INIT_CMD = ['repo', 'init', '--repo-url', constants.REPO_URL]
 
@@ -155,7 +126,7 @@ class RepoRepository(object):
   LRU_THRESHOLD = 5
 
   def __init__(self, repo_url, directory, branch=None, referenced_repo=None,
-               manifest=None, depth=None):
+               manifest=constants.DEFAULT_MANIFEST, depth=None):
     self.repo_url = repo_url
     self.directory = directory
     self.branch = branch
@@ -174,7 +145,7 @@ class RepoRepository(object):
 
     # If the repo exists already, force a selfupdate as the first step.
     self._repo_update_needed = IsARepoRoot(self.directory)
-    if not self._repo_update_needed and InARepoRepository(self.directory):
+    if not self._repo_update_needed and git.FindRepoDir(self.directory):
       raise ValueError('Given directory %s is not the root of a repository.'
                        % self.directory)
 
@@ -247,7 +218,7 @@ class RepoRepository(object):
       init_cmd.extend(['--manifest-branch', self.branch])
 
     cros_build_lib.RunCommand(init_cmd, cwd=self.directory, input='\n\ny\n')
-    if local_manifest and local_manifest != self.DEFAULT_MANIFEST:
+    if local_manifest and local_manifest != self._manifest:
       self._SwitchToLocalManifest(local_manifest)
 
   @property
@@ -296,6 +267,11 @@ class RepoRepository(object):
     cros_build_lib.RunCommand(
         ['git', 'config', '--file', self._ManifestConfig, 'repo.reference',
          self._referenced_repo])
+
+  def Detach(self):
+    """Detach projects back to manifest versions.  Effectively a 'reset'."""
+    cros_build_lib.RunCommand(['repo', '--time', 'sync', '-d'],
+                              cwd=self.directory)
 
   def Sync(self, local_manifest=None, jobs=None, cleanup=True,
            all_branches=False, network_only=False):

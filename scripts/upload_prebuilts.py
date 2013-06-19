@@ -282,6 +282,8 @@ def UpdateBinhostConfFile(path, key, value):
   cwd = os.path.dirname(os.path.abspath(path))
   filename = os.path.basename(path)
   osutils.SafeMakedirs(cwd)
+  if not git.GetCurrentBranch(cwd):
+    git.CreatePushBranch(constants.STABLE_EBUILD_BRANCH, cwd, sync=False)
   osutils.WriteFile(path, '', mode='a')
   UpdateLocalFile(path, value, key)
   cros_build_lib.RunCommand(['git', 'add', filename], cwd=cwd)
@@ -428,7 +430,7 @@ class PrebuiltUploader(object):
 
     # Finally, also update the pointer to the latest SDK on which polling
     # scripts rely.
-    with osutils.TempDirContextManager() as tmpdir:
+    with osutils.TempDir() as tmpdir:
       pointerfile = os.path.join(tmpdir, 'cros-sdk-latest.conf')
       remote_pointerfile = toolchain.GetSdkURL(for_gsutil=True,
                                                suburl='cros-sdk-latest.conf')
@@ -741,10 +743,11 @@ def main(_argv):
   acl = 'public-read'
   binhost_base_url = options.binhost_base_url
 
-  if target and options.private:
+  if options.private:
     binhost_base_url = options.upload
-    board_path = GetBoardOverlay(options.build_path, target)
-    acl = os.path.join(board_path, _GOOGLESTORAGE_ACL_FILE)
+    if target:
+      board_path = GetBoardOverlay(options.build_path, target)
+      acl = os.path.join(board_path, _GOOGLESTORAGE_ACL_FILE)
 
   uploader = PrebuiltUploader(options.upload, acl, binhost_base_url,
                               pkg_indexes, options.build_path,

@@ -186,8 +186,8 @@ class GSContextInitTest(cros_test_lib.MockTempDirTestCase):
 
   def testBadGSUtilBin(self):
     """Test exception thrown for bad gsutil paths."""
-    with PatchGS('DEFAULT_GSUTIL_BIN', new=self.bad_path):
-      self.assertRaises(gs.GSContextException, gs.GSContext)
+    self.assertRaises(gs.GSContextException, gs.GSContext,
+                      gsutil_bin=self.bad_path)
 
   def testInitBotoFileEnv(self):
     os.environ['BOTO_CONFIG'] = self.gsutil_bin
@@ -207,8 +207,8 @@ class GSContextInitTest(cros_test_lib.MockTempDirTestCase):
 
   def testInitBotoFileError(self):
     """Test bad boto file."""
-    with PatchGS('DEFAULT_GSUTIL_BIN', self.bad_path):
-      self.assertRaises(gs.GSContextException, gs.GSContext)
+    self.assertRaises(gs.GSContextException, gs.GSContext,
+                      boto_file=self.bad_path)
 
   def testInitAclFile(self):
     """Test ACL selection logic in __init__."""
@@ -227,7 +227,7 @@ class GSContextTest(AbstractGSContextTest):
       ctx.Copy('/blah', 'gs://foon')
       cmd = [self.ctx.gsutil_bin, 'cp', '--', '/blah', 'gs://foon']
       cros_build_lib.RetryCommand.assert_called_once_with(
-          mock.ANY, retries, cmd, sleep=sleep, redirect_stderr=True,
+          mock.ANY, retries, cmd, sleep=sleep,
           extra_env={'BOTO_CONFIG': mock.ANY})
 
   def testDoCommandDefault(self):
@@ -277,6 +277,10 @@ Please see http://code.google.com/apis/storage/docs/signup.html for
 details about activating the Google Cloud Storage service and then run the
 "gsutil config" command to configure gsutil to use these credentials."""
 
+  GS_LS_ERROR2 = """\
+GSResponseError: status=400, code=MissingSecurityHeader, reason=Bad Request, \
+detail=Authorization."""
+
   GS_LS_BENIGN = """\
 "GSResponseError: status=400, code=MissingSecurityHeader, reason=Bad Request,
 detail=A nonempty x-goog-project-id header is required for this request."""
@@ -285,10 +289,20 @@ detail=A nonempty x-goog-project-id header is required for this request."""
     self.boto_file = os.path.join(self.tempdir, 'boto_file')
     self.ctx = gs.GSContext(boto_file=self.boto_file)
 
-  def testInitGSLsSkippableError(self):
+  def testGSLsSkippableError(self):
     """Benign GS error."""
     self.gs_mock.AddCmdResult(['ls'], returncode=1, error=self.GS_LS_BENIGN)
-    self.ctx._InitBoto()
+    self.assertTrue(self.ctx._TestGSLs())
+
+  def testGSLsAuthorizationError1(self):
+    """GS authorization error 1."""
+    self.gs_mock.AddCmdResult(['ls'], returncode=1, error=self.GS_LS_ERROR)
+    self.assertFalse(self.ctx._TestGSLs())
+
+  def testGSLsError2(self):
+    """GS authorization error 2."""
+    self.gs_mock.AddCmdResult(['ls'], returncode=1, error=self.GS_LS_ERROR2)
+    self.assertFalse(self.ctx._TestGSLs())
 
   def _WriteBotoFile(self, contents, *_args, **_kwargs):
     osutils.WriteFile(self.ctx.boto_file, contents)

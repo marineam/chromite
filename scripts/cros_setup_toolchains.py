@@ -531,43 +531,6 @@ def ShowBoardConfig(board):
       toolchain.FilterToolchains(toolchains, 'default', False).keys())
 
 
-def GenerateLdsoWrapper(root, path, interp, libpaths=()):
-  """Generate a shell script wrapper which uses local ldso to run the ELF
-
-  Since we cannot rely on the host glibc (or other libraries), we need to
-  execute the local packaged ldso directly and tell it where to find our
-  copies of libraries.
-
-  Args:
-    root: The root tree to generate scripts inside of
-    path: The full path (inside |root|) to the program to wrap
-    interp: The ldso interpreter that we need to execute
-    libpaths: Extra lib paths to search for libraries
-  """
-  basedir = os.path.dirname(path)
-  libpaths = ['/lib'] + list(libpaths)
-  replacements = {
-      'interp': os.path.join(os.path.relpath('/lib', basedir),
-                             os.path.basename(interp)),
-      'libpaths': ':'.join(['${basedir}/' + os.path.relpath(p, basedir)
-                            for p in libpaths]),
-  }
-  wrapper = """#!/bin/sh
-base=$(realpath "$0")
-basedir=${base%%/*}
-exec \
-  "${basedir}/%(interp)s" \
-  --library-path "%(libpaths)s" \
-  --inhibit-rpath '' \
-  "${base}.elf" \
-  "$@"
-""" % replacements
-  wrappath = root + path
-  os.rename(wrappath, wrappath + '.elf')
-  osutils.WriteFile(wrappath, wrapper)
-  os.chmod(wrappath, 0755)
-
-
 def GeneratePathWrapper(root, wrappath, path):
   """Generate a shell script to execute another shell script
 
@@ -754,8 +717,9 @@ def _BuildInitialPackageRoot(output_dir, paths, elfs, ldpaths,
     interp = e['interp']
     if interp:
       # Generate a wrapper if it is executable.
-      GenerateLdsoWrapper(output_dir, path_rewrite_func(elf), interp,
-                          libpaths=e['rpath'] + e['runpath'])
+      interp = os.path.join('/lib', os.path.basename(interp))
+      lddtree.GenerateLdsoWrapper(output_dir, path_rewrite_func(elf), interp,
+                                  libpaths=e['rpath'] + e['runpath'])
 
     for lib, lib_data in e['libs'].iteritems():
       if lib in donelibs:
@@ -907,7 +871,7 @@ def CreatePackages(targets_wanted, output_dir, root='/'):
   ldpaths = lddtree.LoadLdpaths(root)
   targets = ExpandTargets(targets_wanted)
 
-  with osutils.TempDirContextManager() as tempdir:
+  with osutils.TempDir() as tempdir:
     # We have to split the root generation from the compression stages.  This is
     # because we hardlink in all the files (to avoid overhead of reading/writing
     # the copies multiple times).  But tar gets angry if a file's hardlink count

@@ -327,16 +327,24 @@ class PartialMock(object):
     self.backup = {}
     self.patchers = {}
     self.patched = {}
+    self.external_patchers = []
     self.create_tempdir = create_tempdir
 
     # Set when start() is called.
+    self._tempdir_obj = None
     self.tempdir = None
     self.__saved_env__ = None
     self.started = False
 
     self._results = {}
-    for attr in self.ATTRS:
-      self._results[attr] = MockedCallResults(attr)
+
+    if not all([self.TARGET, self.ATTRS]) and any([self.TARGET, self.ATTRS]):
+      raise AssertionError('TARGET=%r but ATTRS=%r!'
+                           % (self.TARGET, self.ATTRS))
+
+    if self.ATTRS is not None:
+      for attr in self.ATTRS:
+        self._results[attr] = MockedCallResults(attr)
 
   def __enter__(self):
     return self.start()
@@ -358,7 +366,15 @@ class PartialMock(object):
     not be deleted until after this function returns.
     """
 
+  def StartPatcher(self, patcher):
+    """PartialMock will stop the patcher when stop() is called."""
+    patcher.start()
+    self.external_patchers.append(patcher)
+
   def _start(self):
+    if not all([self.TARGET, self.ATTRS]):
+      return
+
     chunks = self.TARGET.rsplit('.', 1)
     module = cros_build_lib.load_module(chunks[0])
 
@@ -382,11 +398,12 @@ class PartialMock(object):
 
   def start(self):
     """Activates the mock context."""
-    # pylint: disable=W0212
     try:
-      if self.create_tempdir:
-        osutils._TempDirSetup(self)
       self.__saved_env__ = os.environ.copy()
+      self.tempdir = None
+      if self.create_tempdir:
+        self._tempdir_obj = osutils.TempDir(set_global=True)
+        self.tempdir = self._tempdir_obj.tempdir
 
       self.started = True
       self.PreStart()
@@ -395,22 +412,20 @@ class PartialMock(object):
       self.stop()
       raise
 
-  def _stop(self):
-    cros_build_lib.SafeRun([p.stop for p in self.patchers.itervalues()])
-
   def stop(self):
     """Restores namespace to the unmocked state."""
-    # pylint: disable=W0212
     try:
       if self.__saved_env__ is not None:
         osutils.SetEnvironment(self.__saved_env__)
 
-      if self.started:
-        cros_build_lib.SafeRun([self.PreStop, self._stop])
+      tasks = ([self.PreStop] + [p.stop for p in self.patchers.itervalues()] +
+               [p.stop for p in self.external_patchers])
+      if self._tempdir_obj is not None:
+        tasks += [self._tempdir_obj.Cleanup]
+      cros_build_lib.SafeRun(tasks)
     finally:
       self.started = False
-      if getattr(self, 'tempdir', None):
-        osutils._TempDirTearDown(self, False)
+      self.tempdir, self._tempdir_obj = None, None
 
   def UnMockAttr(self, attr):
     """Unsetting the mock of an attribute/function."""
@@ -509,7 +524,7 @@ class PartialCmdMock(PartialMock):
           contained the specified arguments.
       **kwargs: Set of expected keyword arguments.
     """
-    if expected != self.CommandContains(args, **kwargs):
+    if bool(expected) != self.CommandContains(args, **kwargs):
       if expected:
         msg = 'Expected to find %r in any of:\n%s'
       else:

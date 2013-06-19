@@ -21,7 +21,7 @@ from chromite.lib import osutils
 # exists.
 GSUTIL_BIN = None
 PUBLIC_BASE_HTTPS_URL = 'https://commondatastorage.googleapis.com/'
-PRIVATE_BASE_HTTPS_URL = 'https://sandbox.google.com/storage/'
+PRIVATE_BASE_HTTPS_URL = 'https://storage.cloud.google.com/'
 BASE_GS_URL = 'gs://'
 
 
@@ -74,6 +74,9 @@ class GSNoSuchKey(GSContextException):
 class GSContext(object):
   """A class to wrap common google storage operations."""
 
+  # Error messages that indicate an invalid BOTO config.
+  AUTHORIZATION_ERRORS = ('no configured credentials', 'detail=Authorization')
+
   DEFAULT_BOTO_FILE = os.path.expanduser('~/.boto')
   # This is set for ease of testing.
   DEFAULT_GSUTIL_BIN = None
@@ -94,6 +97,8 @@ class GSContext(object):
       gsutil_bin = cls.DEFAULT_GSUTIL_BUILDER_BIN
       if not os.path.exists(gsutil_bin):
         gsutil_bin = osutils.Which('gsutil')
+      if gsutil_bin is None:
+        gsutil_bin = 'gsutil'
       cls.DEFAULT_GSUTIL_BIN = gsutil_bin
     return cls.DEFAULT_GSUTIL_BIN
 
@@ -120,8 +125,7 @@ class GSContext(object):
       logging.debug('Reusing cached gsutil.')
     else:
       logging.debug('Fetching gsutil.')
-      with osutils.TempDirContextManager(
-          base_dir=tar_cache.staging_dir) as tempdir:
+      with osutils.TempDir(base_dir=tar_cache.staging_dir) as tempdir:
         gsutil_tar = os.path.join(tempdir, cls.GSUTIL_TAR)
         cros_build_lib.RunCurl([cls.GSUTIL_URL, '-o', gsutil_tar],
                                debug_level=logging.DEBUG)
@@ -149,12 +153,17 @@ class GSContext(object):
     """
     if gsutil_bin is None:
       gsutil_bin = self.GetDefaultGSUtilBin()
-    self._CheckFile('gsutil not found', gsutil_bin)
+    else:
+      self._CheckFile('gsutil not found', gsutil_bin)
     self.gsutil_bin = gsutil_bin
 
     # Prefer boto_file if specified, else prefer the env then the default.
+    default_boto = False
     if boto_file is None:
-      boto_file = os.environ.get('BOTO_CONFIG', self.DEFAULT_BOTO_FILE)
+      boto_file = os.environ.get('BOTO_CONFIG')
+      if boto_file is None:
+        default_boto = True
+        boto_file = self.DEFAULT_BOTO_FILE
     self.boto_file = boto_file
 
     if acl_file is not None:
@@ -167,7 +176,9 @@ class GSContext(object):
 
     if init_boto:
       self._InitBoto()
-    self._CheckFile('Boto credentials not found', self.boto_file)
+
+    if not default_boto:
+      self._CheckFile('Boto credentials not found', boto_file)
 
   def _CheckFile(self, errmsg, afile):
     """Pre-flight check for valid inputs.
@@ -184,7 +195,7 @@ class GSContext(object):
     result = self._DoCommand(['ls'], retries=0, debug_level=logging.DEBUG,
                              redirect_stderr=True, error_code_ok=True)
     return not (result.returncode == 1 and
-                'no configured credentials' in result.error)
+                any(e in result.error for e in self.AUTHORIZATION_ERRORS))
 
   def _ConfigureBotoConfig(self):
     """Make sure we can access protected bits in GS."""
@@ -202,9 +213,10 @@ class GSContext(object):
     if not self._TestGSLs():
       self._ConfigureBotoConfig()
 
-  def Cat(self, path):
+  def Cat(self, path, **kwargs):
     """Returns the contents of a GS object."""
-    return self._DoCommand(['cat', path], redirect_stdout=True)
+    kwargs.setdefault('redirect_stdout', True)
+    return self._DoCommand(['cat', path], **kwargs)
 
   def CopyInto(self, local_path, remote_dir, filename=None, acl=None,
                version=None):
@@ -232,16 +244,22 @@ class GSContext(object):
                       acl=acl, version=version)
 
   def _RunCommand(self, cmd, **kwargs):
+    kwargs.setdefault('redirect_stderr', True)
     try:
       return cros_build_lib.RunCommand(cmd, **kwargs)
     # gsutil uses the same exit code for any failure, so we are left to
     # parse the output as needed.
     except cros_build_lib.RunCommandError as e:
       error = e.result.error
-      if error and 'GSResponseError' in error:
-        if 'code=PreconditionFailed' in error:
-          raise GSContextPreconditionFailed(e)
-        if 'code=NoSuchKey' in error:
+      if error:
+        if 'GSResponseError' in error:
+          if 'code=PreconditionFailed' in error:
+            raise GSContextPreconditionFailed(e)
+          if 'code=NoSuchKey' in error:
+            raise GSNoSuchKey(e)
+        # If the file does not exist, one of the following errors occurs.
+        if (error.startswith('InvalidUriError:') or
+            error.startswith('CommandException: No URIs matched')):
           raise GSNoSuchKey(e)
       raise
 
@@ -312,11 +330,12 @@ class GSContext(object):
     # For ease of testing, only pass headers if we got some.
     if headers:
       kwargs['headers'] = headers
-    return self._DoCommand(cmd, redirect_stderr=True, **kwargs)
+    return self._DoCommand(cmd, **kwargs)
 
-  def LS(self, path):
+  def LS(self, path, **kwargs):
     """Does a directory listing of the given gs path."""
-    return self._DoCommand(['ls', '--', path], redirect_stdout=True)
+    kwargs['redirect_stdout'] = True
+    return self._DoCommand(['ls', '--', path], **kwargs)
 
   def SetACL(self, upload_url, acl=None):
     """Set access on a file already in google storage.
@@ -343,8 +362,7 @@ class GSContext(object):
       True if the path exists; otherwise returns False.
     """
     try:
-      self._DoCommand(['getacl', path], redirect_stdout=True,
-                      redirect_stderr=True)
+      self._DoCommand(['getacl', path], redirect_stdout=True)
     except GSNoSuchKey:
       return False
     return True

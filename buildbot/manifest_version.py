@@ -8,6 +8,7 @@ A library to generate and store the manifests for cros builders to use.
 
 import cPickle
 import fnmatch
+import glob
 import logging
 import os
 import re
@@ -21,8 +22,7 @@ from chromite.lib import gs
 from chromite.lib import osutils
 
 
-MANIFEST_VERSIONS_URL = 'gs://chromeos-manifest-versions'
-BUILD_STATUS_URL = '%s/builder-status' % MANIFEST_VERSIONS_URL
+BUILD_STATUS_URL = '%s/builder-status' % constants.MANIFEST_VERSIONS_GS_URL
 PUSH_BRANCH = 'temp_auto_checkin_branch'
 NUM_RETRIES = 20
 
@@ -147,7 +147,7 @@ class VersionInfo(object):
     version_file: version file location.
   """
   # Pattern for matching build name format.  Includes chrome branch hack.
-  VER_PATTERN = '(\d+).(\d+).(\d+)(?:-R(\d+))*'
+  VER_PATTERN = r'(\d+).(\d+).(\d+)(?:-R(\d+))*'
 
   def __init__(self, version_string=None, chrome_branch=None,
                incr_type='build', version_file=None):
@@ -213,7 +213,7 @@ class VersionInfo(object):
        None: on a non match
        value: for a matching key
     """
-    regex = '.*(%s)\s*=\s*(\d+)$' % key
+    regex = r'.*(%s)\s*=\s*(\d+)$' % key
 
     match = re.match(regex, line)
     if match:
@@ -356,7 +356,8 @@ class BuildSpecsManager(object):
   """A Class to manage buildspecs and their states."""
 
   def __init__(self, source_repo, manifest_repo, build_name, incr_type, force,
-               branch, dry_run=True, master=False):
+               branch, manifest=constants.DEFAULT_MANIFEST, dry_run=True,
+               master=False):
     """Initializes a build specs manager.
     Args:
       source_repo: Repository object for the source code.
@@ -365,6 +366,7 @@ class BuildSpecsManager(object):
       incr_type: How we should increment this version - build|branch|patch
       force: Create a new manifest even if there are no changes.
       branch: Branch this builder is running on.
+      manifest: Manifest to use for checkout. E.g. 'full' or 'buildtools'.
       dry_run: Whether we actually commit changes we make or not.
       master: Whether we are the master builder.
     """
@@ -380,6 +382,7 @@ class BuildSpecsManager(object):
     self.incr_type = incr_type
     self.force = force
     self.branch = branch
+    self.manifest = manifest
     self.dry_run = dry_run
     self.master = master
 
@@ -426,18 +429,36 @@ class BuildSpecsManager(object):
     """Checks out manifest versions into the manifest directory."""
     RefreshManifestCheckout(self.manifest_dir, self.manifest_repo)
 
-  def InitializeManifestVariables(self, version_info):
+  def InitializeManifestVariables(self, version_info=None, version=None):
     """Initializes manifest-related instance variables.
 
     Args:
-      version_info: Info class for version information of cros.
+      version_info: Info class for version information of cros. If None,
+                    version must be specified instead.
+      version: Requested version. If None, build the latest version.
+
+    Returns:
+      Whether the requested version was found.
     """
+    assert version_info or version, 'version or version_info must be specified'
     working_dir = os.path.join(self.manifest_dir, self.rel_working_dir)
-    dir_pfx = version_info.chrome_branch
     self.specs_for_builder = os.path.join(working_dir, 'build-name',
                                           '%(builder)s')
     specs_for_build = self.specs_for_builder % {'builder': self.build_name}
-    self.all_specs_dir = os.path.join(working_dir, 'buildspecs', dir_pfx)
+    buildspecs = os.path.join(working_dir, 'buildspecs')
+
+    # If version is specified, find out what Chrome branch it is on.
+    if version is not None:
+      dirs = glob.glob(os.path.join(buildspecs, '*', version + '.xml'))
+      if len(dirs) == 0:
+        return False
+      assert len(dirs) <= 1, 'More than one spec found for %s' % version
+      dir_pfx = os.path.basename(os.path.dirname(dirs[0]))
+      version_info = VersionInfo(chrome_branch=dir_pfx, version_string=version)
+    else:
+      dir_pfx = version_info.chrome_branch
+
+    self.all_specs_dir = os.path.join(buildspecs, dir_pfx)
     self.pass_dir = os.path.join(specs_for_build,
                                  BuilderStatus.STATUS_PASSED, dir_pfx)
     self.fail_dir = os.path.join(specs_for_build,
@@ -445,11 +466,14 @@ class BuildSpecsManager(object):
 
     # Calculate the status of the latest build, and whether the build was
     # processed.
-    self.latest = self._LatestSpecFromDir(version_info, self.all_specs_dir)
-    if self.latest is not None:
-      self._latest_status = self.GetBuildStatus(self.build_name, self.latest)
-      if self._latest_status is None:
-        self.latest_unprocessed = self.latest
+    if version is None:
+      self.latest = self._LatestSpecFromDir(version_info, self.all_specs_dir)
+      if self.latest is not None:
+        self._latest_status = self.GetBuildStatus(self.build_name, self.latest)
+        if self._latest_status is None:
+          self.latest_unprocessed = self.latest
+
+    return True
 
   def GetCurrentVersionInfo(self):
     """Returns the current version info from the version file."""
@@ -512,7 +536,7 @@ class BuildSpecsManager(object):
     return self._latest_status and self._latest_status.Failed()
 
   @staticmethod
-  def GetBuildStatus(builder, version, retries=3):
+  def GetBuildStatus(builder, version, retries=NUM_RETRIES):
     """Returns a BuilderStatus instance for the given the builder.
 
     Args:
@@ -525,18 +549,12 @@ class BuildSpecsManager(object):
       message associated with the status passed by the builder.
     """
     url = BuildSpecsManager._GetStatusUrl(builder, version)
-    cmd = [gs.GSUTIL_BIN, 'cat', url]
+    ctx = gs.GSContext(retries=retries)
     try:
-      # TODO(davidjames): Use chromite.lib.gs here.
-      result = cros_build_lib.RunCommandWithRetries(
-          retries, cmd, redirect_stdout=True, redirect_stderr=True,
-          debug_level=logging.DEBUG)
-    except cros_build_lib.RunCommandError as ex:
-      # If the file does not exist, InvalidUriError is returned.
-      if ex.result.error and ex.result.error.startswith('InvalidUriError:'):
-        return None
-      raise
-    return BuilderStatus(**cPickle.loads(result.output))
+      output = ctx.Cat(url).output
+    except gs.GSNoSuchKey:
+      return None
+    return BuilderStatus(**cPickle.loads(output))
 
   def GetLatestPassingSpec(self):
     """Get the last spec file that passed in the current branch."""
@@ -559,28 +577,18 @@ class BuildSpecsManager(object):
   def BootstrapFromVersion(self, version):
     """Initializes spec data from release version and returns path to manifest.
     """
-    version_info = self.GetCurrentVersionInfo()
-    should_initialize_manifest_repo = True
-    if version:
-      # We need to first set up some variables. This is harmless even if we
-      # don't have the manifests checked out yet.
-      self.InitializeManifestVariables(version_info)
-      # We don't need to reload the manifests repository if we already have the
-      # manifest.
-      if os.path.exists(self.GetLocalManifest(version)):
-        should_initialize_manifest_repo = False
-
-    if should_initialize_manifest_repo:
+    # Only refresh the manifest checkout if needed.
+    if not self.InitializeManifestVariables(version=version):
       self.RefreshManifestCheckout()
-      self.InitializeManifestVariables(version_info)
+      self.InitializeManifestVariables(version=version)
 
+    # Return the current manifest.
     self.current_version = version
     return self.GetLocalManifest(self.current_version)
 
   def CheckoutSourceCode(self):
     """Syncs the cros source to the latest git hashes for the branch."""
-    self.cros_source.Sync(repository.RepoRepository.DEFAULT_MANIFEST,
-                          cleanup=False)
+    self.cros_source.Sync(self.manifest, cleanup=False)
 
   def GetNextBuildSpec(self, retries=NUM_RETRIES):
     """Returns a path to the next manifest to build.
@@ -640,23 +648,18 @@ class BuildSpecsManager(object):
       message: Additional message explaining the status.
       fail_if_exists: If set, fail if the status already exists.
     """
-    cmd = [gs.GSUTIL_BIN]
-    if fail_if_exists:
-      # This HTTP header tells Google Storage toreturn the PreconditionFailed
-      # error message if the file already exists.
-      cmd += ['-h', 'x-goog-if-generation-match: 0']
     url = BuildSpecsManager._GetStatusUrl(self.build_name, version)
-    cmd += ['cp', '-', url]
 
-    # Create a BuilderStatus object and pickle it.
+    # Pickle the dictionary needed to create a BuilderStatus object.
     data = cPickle.dumps(dict(status=status, message=message))
 
-    if self.dry_run:
-      logging.info('Would have run: %s', ' '.join(cmd))
-    else:
-      # TODO(davidjames): Use chromite.lib.gs here.
-      cros_build_lib.RunCommandWithRetries(
-          3, cmd, redirect_stdout=True, redirect_stderr=True, input=data)
+    # This HTTP header tells Google Storage to return the PreconditionFailed
+    # error message if the file already exists.
+    gs_version = 0 if fail_if_exists else None
+
+    # Do the actual upload.
+    ctx = gs.GSContext(dry_run=self.dry_run)
+    ctx.Copy('-', url, input=data, version=gs_version)
 
   def UploadStatus(self, success, message=None):
     """Uploads the status of the build for the current build spec.

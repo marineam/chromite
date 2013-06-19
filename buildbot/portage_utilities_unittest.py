@@ -17,10 +17,12 @@ if __name__ == '__main__':
 
 from chromite.lib import cros_build_lib
 from chromite.lib import cros_test_lib
+from chromite.lib import git
 from chromite.lib import osutils
 from chromite.buildbot import portage_utilities
 
-# pylint: disable=W0212,E1120
+# pylint: disable=W0212
+MANIFEST = git.ManifestCheckout.Cached(constants.SOURCE_ROOT)
 
 class _Package(object):
   def __init__(self, package):
@@ -141,6 +143,7 @@ class ProjectAndPathTest(cros_test_lib.MoxTempDirTestCase):
   def _MockParseWorkonVariables(self, fake_projects, _fake_localname,
                                 _fake_subdir, fake_ebuild_contents):
     """Mock the necessary calls, start Replay mode, call GetSourcePath()."""
+    # pylint: disable=E1120
     self.mox.StubOutWithMock(os.path, 'isdir')
     self.mox.StubOutWithMock(portage_utilities.EBuild, 'GetGitProjectName')
 
@@ -151,11 +154,11 @@ class ProjectAndPathTest(cros_test_lib.MoxTempDirTestCase):
     for p in fake_projects:
       os.path.isdir(mox.IgnoreArg()).AndReturn(True)
       portage_utilities.EBuild.GetGitProjectName(
-          mox.IgnoreArg()).AndReturn(p)
+          MANIFEST, mox.IgnoreArg()).AndReturn(p)
     self.mox.ReplayAll()
 
     ebuild = portage_utilities.EBuild(ebuild_path)
-    result = ebuild.GetSourcePath(self.tempdir)
+    result = ebuild.GetSourcePath(self.tempdir, MANIFEST)
     self.mox.VerifyAll()
     return result
 
@@ -244,6 +247,7 @@ class EBuildRevWorkonTest(cros_test_lib.MoxTempDirTestCase):
     self.revved_ebuild_path = package_name + '-r2.ebuild'
 
   def createRevWorkOnMocks(self, ebuild_content, rev, multi=False):
+    # pylint: disable=E1120
     self.mox.StubOutWithMock(os.path, 'exists')
     self.mox.StubOutWithMock(cros_build_lib, 'Die')
     self.mox.StubOutWithMock(portage_utilities.shutil, 'copyfile')
@@ -257,12 +261,13 @@ class EBuildRevWorkonTest(cros_test_lib.MoxTempDirTestCase):
     self.mox.StubOutWithMock(portage_utilities.EBuild, 'GetTreeId')
 
     if multi:
-      portage_utilities.EBuild.GetSourcePath('/sources').AndReturn(
+      portage_utilities.EBuild.GetSourcePath('/sources', MANIFEST).AndReturn(
           (['fake_project1','fake_project2'], ['p1_path1','p1_path2']))
     else:
-      portage_utilities.EBuild.GetSourcePath('/sources').AndReturn(
+      portage_utilities.EBuild.GetSourcePath('/sources', MANIFEST).AndReturn(
           (['fake_project1'], ['p1_path']))
-    portage_utilities.EBuild.GetVersion('/sources', '0.0.1').AndReturn('0.0.1')
+    portage_utilities.EBuild.GetVersion('/sources', MANIFEST,
+        '0.0.1').AndReturn('0.0.1')
     if multi:
       portage_utilities.EBuild.GetTreeId('p1_path1').AndReturn('treehash1')
       portage_utilities.EBuild.GetTreeId('p1_path2').AndReturn('treehash2')
@@ -302,15 +307,6 @@ class EBuildRevWorkonTest(cros_test_lib.MoxTempDirTestCase):
         portage_utilities.EBuild._RunCommand(
             ['git', 'rm', self.m_ebuild.ebuild_path],
             cwd=self.overlay)
-      if multi:
-        message = portage_utilities._GIT_COMMIT_MESSAGE % (
-          self.m_ebuild.package, 'my_id1,my_id2')
-      else:
-        message = portage_utilities._GIT_COMMIT_MESSAGE % (
-          self.m_ebuild.package, 'my_id')
-      cros_build_lib.RunCommand(
-          ['git', 'commit', '-a', '-m', message], cwd=self.overlay,
-          print_cmd=False)
     else:
       os.unlink(self.revved_ebuild_path)
 
@@ -321,7 +317,8 @@ class EBuildRevWorkonTest(cros_test_lib.MoxTempDirTestCase):
     """Test Uprev of a single project ebuild."""
     m_file = self.createRevWorkOnMocks(self._mock_ebuild, rev=True)
     self.mox.ReplayAll()
-    result = self.m_ebuild.RevWorkOnEBuild('/sources', redirect_file=m_file)
+    result = self.m_ebuild.RevWorkOnEBuild('/sources', MANIFEST,
+                                           redirect_file=m_file)
     self.mox.VerifyAll()
     self.assertEqual(result, 'category/test_package-0.0.1-r2')
 
@@ -330,7 +327,8 @@ class EBuildRevWorkonTest(cros_test_lib.MoxTempDirTestCase):
     m_file = self.createRevWorkOnMocks(self._mock_ebuild_multi, rev=True,
                                        multi=True)
     self.mox.ReplayAll()
-    result = self.m_ebuild.RevWorkOnEBuild('/sources', redirect_file=m_file)
+    result = self.m_ebuild.RevWorkOnEBuild('/sources', MANIFEST,
+                                           redirect_file=m_file)
     self.mox.VerifyAll()
     self.assertEqual(result, 'category/test_package-0.0.1-r2')
 
@@ -338,7 +336,8 @@ class EBuildRevWorkonTest(cros_test_lib.MoxTempDirTestCase):
     m_file = self.createRevWorkOnMocks(self._mock_ebuild, rev=False)
 
     self.mox.ReplayAll()
-    result = self.m_ebuild.RevWorkOnEBuild('/sources', redirect_file=m_file)
+    result = self.m_ebuild.RevWorkOnEBuild('/sources', MANIFEST,
+                                           redirect_file=m_file)
     self.mox.VerifyAll()
     self.assertEqual(result, None)
 
@@ -352,7 +351,8 @@ class EBuildRevWorkonTest(cros_test_lib.MoxTempDirTestCase):
       self._mock_ebuild[0:1] + self._mock_ebuild[2:], rev=True)
 
     self.mox.ReplayAll()
-    result = self.m_ebuild.RevWorkOnEBuild('/sources', redirect_file=m_file)
+    result = self.m_ebuild.RevWorkOnEBuild('/sources', MANIFEST,
+                                           redirect_file=m_file)
     self.mox.VerifyAll()
     self.assertEqual(result, 'category/test_package-0.0.1-r1')
 
@@ -386,15 +386,15 @@ class EBuildRevWorkonTest(cros_test_lib.MoxTempDirTestCase):
     project_ebuilds = {ebuild1: projects}
     portage_utilities.FindOverlays(
         constants.BOTH_OVERLAYS, buildroot=build_root).AndReturn(overlays)
-    cls._GetEBuildProjects(
-        build_root, overlays, changes).AndReturn(project_ebuilds)
+    cls._GetEBuildProjects(build_root, mox.IgnoreArg(), overlays,
+                           changes).AndReturn(project_ebuilds)
     for i, p in enumerate(projects):
       cls._GetSHA1ForProject(mox.IgnoreArg(), p).InAnyOrder().AndReturn(str(i))
     cls.UpdateEBuild(ebuild1.ebuild_path, dict(CROS_WORKON_COMMIT='("0" "1")'))
     cls.GitRepoHasChanges('public_overlay').AndReturn(True)
     cls.CommitChange(mox.IgnoreArg(), overlay='public_overlay')
     self.mox.ReplayAll()
-    cls.UpdateCommitHashesForChanges(changes, build_root)
+    cls.UpdateCommitHashesForChanges(changes, build_root, MANIFEST)
     self.mox.VerifyAll()
 
   def testGitRepoHasChanges(self):
@@ -426,6 +426,7 @@ class FindOverlaysTest(cros_test_lib.MoxTestCase):
       self.overlays[b] = d = {}
       for o in (self.PRIVATE, self.PUBLIC, self.BOTH, None):
         d[o] = portage_utilities.FindOverlays(o, b, constants.SOURCE_ROOT)
+    self.no_overlays = not bool(any(d.values()))
 
   def testMissingPrimaryOverlay(self):
     """Test what happens when a primary overlay is missing.
@@ -459,6 +460,9 @@ class FindOverlaysTest(cros_test_lib.MoxTestCase):
     there may not be any private overlays, e.g. if the user has
     a public checkout.)
     """
+    if self.no_overlays:
+      return
+
     for d in self.overlays.itervalues():
       self.assertTrue(set(d[self.BOTH]) >= set(d[self.PUBLIC]))
       self.assertTrue(set(d[self.BOTH]) > set(d[self.PRIVATE]))
@@ -474,12 +478,18 @@ class FindOverlaysTest(cros_test_lib.MoxTestCase):
     If we specify a non-existent board to FindOverlays, only generic
     overlays should be returned.
     """
+    if self.no_overlays:
+      return
+
     for o in (self.PUBLIC, self.BOTH):
       self.assertTrue(set(self.overlays[self.FAKE][o]) <
                       set(self.overlays[self.MARIO][o]))
 
   def testAllBoards(self):
     """If we specify board=None, all overlays should be returned."""
+    if self.no_overlays:
+      return
+
     for o in (self.PUBLIC, self.BOTH):
       for b in (self.FAKE, self.MARIO):
         self.assertTrue(set(self.overlays[b][o]) < set(self.overlays[None][o]))
@@ -490,6 +500,9 @@ class FindOverlaysTest(cros_test_lib.MoxTestCase):
     Further, the only difference between the public overlays for mario and a
     fake board is the primary overlay, which is listed last.
     """
+    if self.no_overlays:
+      return
+
     mario_primary = portage_utilities.FindPrimaryOverlay(self.BOTH, self.MARIO,
                                                          constants.SOURCE_ROOT)
     self.assertTrue(mario_primary in self.overlays[self.MARIO][self.BOTH])
@@ -517,8 +530,7 @@ class BuildEBuildDictionaryTest(cros_test_lib.MoxTestCase):
     package = _Package(self.package)
     portage_utilities._FindUprevCandidates([]).AndReturn(package)
     self.mox.ReplayAll()
-    portage_utilities.BuildEBuildDictionary(
-        overlays, False, [self.package])
+    portage_utilities.BuildEBuildDictionary(overlays, False, [self.package])
     self.mox.VerifyAll()
     self.assertEquals(len(overlays), 1)
     self.assertEquals(overlays["/overlay"], [package])
@@ -575,9 +587,10 @@ class ProjectMappingTest(cros_test_lib.TestCase):
       ([kernel], set([kernel_project])),
       ([power_manager, kernel], set([power_manager_project, kernel_project]))
     ]
-    for packages, projects in matches:
-      self.assertEquals(projects,
-                        portage_utilities.FindWorkonProjects(packages))
+    if portage_utilities.FindOverlays(constants.BOTH_OVERLAYS):
+      for packages, projects in matches:
+        self.assertEquals(projects,
+                          portage_utilities.FindWorkonProjects(packages))
 
 class PackageDBTest(cros_test_lib.MoxTempDirTestCase):
   fake_pkgdb = { 'category1' : [ 'package-1', 'package-2' ],

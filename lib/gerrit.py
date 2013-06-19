@@ -257,25 +257,27 @@ class GerritHelper(object):
 
   def Query(self, query, sort=None, current_patch=True, options=(),
             dryrun=False, raw=False, _resume_sortkey=None):
-    """Freeform querying of a gerrit server
+    """Freeform querying of a gerrit server.
 
     Args:
-     query: gerrit query to run: see the official docs for valid parameters:
-       http://gerrit.googlecode.com/svn/documentation/2.1.7/cmd-query.html
-     sort: if given, the key in the resultant json to sort on
-     current_patch: If True, append --current-patch-set to options.  If this
-       is set to False, return the raw dictionary.  If False, raw is forced
-       to True.
-     options: any additional commandline options to pass to gerrit query
+      query: gerrit query to run: see the official docs for valid parameters:
+        http://gerrit.googlecode.com/svn/documentation/2.1.7/cmd-query.html
+      sort: if given, the key in the resultant json to sort on
+      current_patch: If True, append --current-patch-set to options.  If this
+        is set to False, return the raw dictionary.  If False, raw is forced
+        to True.
+      options: Any additional commandline options to pass to the gerrit query.
 
     Returns:
-     a sequence of dictionaries from the gerrit server
+      A sequence of JSON dictionaries from the gerrit server. This includes
+      patch dependencies in the 'dependsOn' and 'neededBy' fields.
     Raises:
-     RunCommandException if the invocation fails, or GerritException if
-     there is something wrong w/ the query parameters given
+      RunCommandException if the invocation fails, or GerritException if
+      there is something wrong with the query parameters given
     """
 
-    cmd = self.ssh_prefix + ['gerrit', 'query', '--format=JSON']
+    cmd = self.ssh_prefix + ['gerrit', 'query', '--format=JSON',
+                             '--dependencies', '--commit-message']
     cmd.extend(options)
     if current_patch:
       cmd.append('--current-patch-set')
@@ -463,29 +465,6 @@ class GerritHelper(object):
              " AND category_id='COMR';"
              % (change.gerrit_number, change.patch_number))
     self._SqlQuery(query, dryrun=dryrun, is_command=True)
-
-  def FindContentMergingProjects(self):
-    """Query the gerrit server to find which projects have content merging on
-
-    Content merging is also known as 3way merging; if enabled, changes that
-    aren't in the same git historical lineage and touch the same file can
-    fall back to patch (fuzzy matches) semantics.  If disabled, then changes
-    that try to touch the same file *must* be on the same lineage.
-
-    Returns:
-      A set of all projects that have content merging enabled
-    """
-
-    # Example json output from gerrit:
-    # {"type":"row","columns":{"name":"webm/libvpx"}}
-    # {"type":"row","columns":{"name":"webm/adaptive-prototype-manifest"}}
-    # {"type":"row","columns":{"name":"webm/bitstream-guide"}}
-    # {"type":"row","columns":{"name":"chromiumos/chromite"}}
-    # {"type":"query-stats","rowCount":4,"runTimeMilliseconds":2}
-
-    results = self._SqlQuery(
-        "SELECT name FROM projects where use_content_merge='Y';")
-    return frozenset(x['columns']['name'] for x in results)
 
 
 def GetGerritPatchInfo(patches):

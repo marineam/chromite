@@ -29,9 +29,6 @@ _GLOBAL_OVERLAYS = [
   '%(buildroot)s/src/third_party/portage',
 ]
 
-# Takes two strings, package_name and commit_id.
-_GIT_COMMIT_MESSAGE = 'Marking 9999 ebuild for %s with commit(s) %s as stable.'
-
 # Define datastructures for holding PV and CPV objects.
 _PV_FIELDS = ['pv', 'package', 'version', 'version_no_rev', 'rev']
 PV = collections.namedtuple('PV', _PV_FIELDS)
@@ -39,12 +36,12 @@ CPV = collections.namedtuple('CPV', ['category'] + _PV_FIELDS)
 
 # Package matching regexp, as dictated by package manager specification:
 # http://www.gentoo.org/proj/en/qa/pms.xml
-_pkg = '(?P<package>' + '[\w+][\w+-]*)'
-_ver = '(?P<version>' + \
-       '(?P<version_no_rev>(\d+)((\.\d+)*)([a-z]?)' + \
-       '((_(pre|p|beta|alpha|rc)\d*)*))' + \
-       '(-(?P<rev>r(\d+)))?)'
-_pvr_re = re.compile('^(?P<pv>%s-%s)$' % (_pkg, _ver), re.VERBOSE)
+_pkg = r'(?P<package>' + r'[\w+][\w+-]*)'
+_ver = r'(?P<version>' + \
+       r'(?P<version_no_rev>(\d+)((\.\d+)*)([a-z]?)' + \
+       r'((_(pre|p|beta|alpha|rc)\d*)*))' + \
+       r'(-(?P<rev>r(\d+)))?)'
+_pvr_re = re.compile(r'^(?P<pv>%s-%s)$' % (_pkg, _ver), re.VERBOSE)
 
 # This regex matches blank lines, commented lines, and the EAPI line.
 _blank_or_eapi_re = re.compile(r'^\s*(?:#|EAPI=|$)')
@@ -241,10 +238,10 @@ class EBuild(object):
     """Commits current changes in git locally with given commit message.
 
     Args:
-        message: the commit string to write when committing to git.
-        overlay: directory in which to commit the changes.
+      message: the commit string to write when committing to git.
+      overlay: directory in which to commit the changes.
     Raises:
-        RunCommandError: Error occurred while committing.
+      RunCommandError: Error occurred while committing.
     """
     logging.info('Committing changes with commit message: %s', message)
     git_commit_cmd = ['git', 'commit', '-a', '-m', message]
@@ -252,7 +249,11 @@ class EBuild(object):
                               print_cmd=cls.VERBOSE)
 
   def __init__(self, path):
-    """Sets up data about an ebuild from its path."""
+    """Sets up data about an ebuild from its path.
+
+    Args:
+      path: Path to the ebuild.
+    """
     self._overlay, self._category, self._pkgname, filename = path.rsplit('/', 3)
     m = self._PACKAGE_VERSION_PATTERN.match(filename)
     if not m:
@@ -298,13 +299,11 @@ class EBuild(object):
         self.is_blacklisted = True
     fileinput.close()
 
-  def GetGitProjectName(self, path):
+  def GetGitProjectName(self, manifest, path):
     """Read the project variable from a git repository at given path."""
-    cmd = ('git config --get remote.cros.projectname || '
-           'git config --get remote.cros-internal.projectname')
-    return self._RunCommand(cmd, cwd=path, shell=True).rstrip()
+    return manifest.FindProjectFromPath(path)
 
-  def GetSourcePath(self, srcroot):
+  def GetSourcePath(self, srcroot, manifest):
     """Get the project and path for this ebuild.
 
     The path is guaranteed to exist, be a directory, and be absolute.
@@ -356,7 +355,7 @@ class EBuild(object):
                            'for project %s does not exist.' % (subdir_path,
                                                                self._pkgname))
       # Verify that we're grabbing the commit id from the right project name.
-      real_project = self.GetGitProjectName(subdir_path)
+      real_project = self.GetGitProjectName(manifest, subdir_path)
       if project != real_project:
         cros_build_lib.Die('Project name mismatch for %s '
                            '(found %s, expected %s)' % (subdir_path,
@@ -382,7 +381,7 @@ class EBuild(object):
       cros_build_lib.Die('Cannot determine HEAD tree hash for %s' % srcdir)
     return output.rstrip()
 
-  def GetVersion(self, srcroot, default):
+  def GetVersion(self, srcroot, manifest, default):
     """Get the base version number for this ebuild.
 
     The version is provided by the ebuild through a specific script in
@@ -394,7 +393,7 @@ class EBuild(object):
     if not os.path.exists(vers_script):
       return default
 
-    srcdirs = self.GetSourcePath(srcroot)[1]
+    srcdirs = self.GetSourcePath(srcroot, manifest)[1]
 
     # The chromeos-version script will output a usable raw version number,
     # or nothing in case of error or no available version
@@ -430,7 +429,7 @@ class EBuild(object):
     else:
       return '"%s"' % unformatted_list[0]
 
-  def RevWorkOnEBuild(self, srcroot, redirect_file=None):
+  def RevWorkOnEBuild(self, srcroot, manifest, redirect_file=None):
     """Revs a workon ebuild given the git commit hash.
 
     By default this class overwrites a new ebuild given the normal
@@ -438,25 +437,27 @@ class EBuild(object):
     to redirect the new stable ebuild to another file.
 
     Args:
-        srcroot: full path to the 'src' subdirectory in the source
-          repository.
-        redirect_file: Optional file to write the new ebuild.  By default
-          it is written using the standard rev'ing logic.  This file must be
-          opened and closed by the caller.
+      srcroot: full path to the 'src' subdirectory in the source
+        repository.
+      manifest: git.ManifestCheckout object.
+      redirect_file: Optional file to write the new ebuild.  By default
+        it is written using the standard rev'ing logic.  This file must be
+        opened and closed by the caller.
 
     Raises:
-        OSError: Error occurred while creating a new ebuild.
-        IOError: Error occurred while writing to the new revved ebuild file.
+      OSError: Error occurred while creating a new ebuild.
+      IOError: Error occurred while writing to the new revved ebuild file.
     Returns:
       If the revved package is different than the old ebuild, return the full
       revved package name, including the version number. Otherwise, return None.
     """
 
     if self.is_stable:
-      stable_version_no_rev = self.GetVersion(srcroot, self.version_no_rev)
+      stable_version_no_rev = self.GetVersion(srcroot, manifest,
+                                              self.version_no_rev)
     else:
       # If given unstable ebuild, use preferred version rather than 9999.
-      stable_version_no_rev = self.GetVersion(srcroot, '0.0.1')
+      stable_version_no_rev = self.GetVersion(srcroot, manifest, '0.0.1')
 
     new_version = '%s-r%d' % (
         stable_version_no_rev, self.current_revision + 1)
@@ -468,7 +469,7 @@ class EBuild(object):
       cros_build_lib.Die('Missing unstable ebuild: %s' %
                          self._unstable_ebuild_path)
 
-    srcdirs = self.GetSourcePath(srcroot)[1]
+    srcdirs = self.GetSourcePath(srcroot, manifest)[1]
     commit_ids = map(self.GetCommitId, srcdirs)
     tree_ids = map(self.GetTreeId, srcdirs)
     variables = dict(CROS_WORKON_COMMIT=self.FormatBashArray(commit_ids),
@@ -490,8 +491,6 @@ class EBuild(object):
         self._RunCommand(['git', 'rm', old_ebuild_path],
                          cwd=self._overlay)
 
-      message = _GIT_COMMIT_MESSAGE % (self.package, ','.join(commit_ids))
-      self.CommitChange(message, self._overlay)
       return '%s-%s' % (self.package, new_version)
 
   @classmethod
@@ -526,11 +525,12 @@ class EBuild(object):
     return helper.GetLatestSHA1ForBranch(project, branch)
 
   @staticmethod
-  def _GetEBuildProjects(buildroot, overlay_list, changes):
+  def _GetEBuildProjects(buildroot, manifest, overlay_list, changes):
     """Calculate ebuild->project map for changed ebuilds.
 
     Args:
       buildroot: Path to root of build directory.
+      manifest: git.ManifestCheckout object.
       overlay_list: List of all overlays.
       changes: Changes from Gerrit that are being pushed.
 
@@ -544,23 +544,24 @@ class EBuild(object):
     ebuild_projects = {}
     for ebuilds in overlay_dict.itervalues():
       for ebuild in ebuilds:
-        projects = ebuild.GetSourcePath(directory_src)[0]
+        projects = ebuild.GetSourcePath(directory_src, manifest)[0]
         if changed_projects.intersection(projects):
           ebuild_projects[ebuild] = projects
     return ebuild_projects
 
   @classmethod
-  def UpdateCommitHashesForChanges(cls, changes, buildroot):
+  def UpdateCommitHashesForChanges(cls, changes, buildroot, manifest):
     """Updates the commit hashes for the EBuilds uprevved in changes.
 
     Args:
       changes: Changes from Gerrit that are being pushed.
       buildroot: Path to root of build directory.
+      manifest: git.ManifestCheckout object.
     """
-    manifest = git.ManifestCheckout.Cached(buildroot)
     project_sha1s = {}
     overlay_list = FindOverlays(constants.BOTH_OVERLAYS, buildroot=buildroot)
-    ebuild_projects = cls._GetEBuildProjects(buildroot, overlay_list, changes)
+    ebuild_projects = cls._GetEBuildProjects(buildroot, manifest, overlay_list,
+                                             changes)
     for ebuild, projects in ebuild_projects.iteritems():
       for project in set(projects).difference(project_sha1s):
         project_sha1s[project] = cls._GetSHA1ForProject(manifest, project)

@@ -29,11 +29,12 @@ class CopyTest(cros_test_lib.TempDirTestCase):
                      strict=False, sloppy=False):
     cros_test_lib.CreateOnDiskHierarchy(self.src_base, src_struct)
     if error:
-      self.assertRaises(error, path.Copy, self.src_base, self.dest_base, None,
-                        strict, sloppy)
+      self.assertRaises(error, self.copier.Copy, self.src_base, self.dest_base,
+                        path, strict=strict, sloppy=sloppy)
       return
 
-    path.Copy(self.src_base, self.dest_base, self.copier, strict, sloppy)
+    self.copier.Copy(self.src_base, self.dest_base, path, strict=strict,
+                     sloppy=sloppy)
     cros_test_lib.VerifyOnDiskHierarchy(self.dest_base, dest_struct)
 
 
@@ -163,12 +164,27 @@ class FileCopyTest(CopyTest):
     self._CopyAndVerify(path, src_struct, dest_struct,
                         error=chrome_util.MustNotBeDirError)
 
-  def testElementOptional(self):
+  def testElementOptional(self, cond=None, strict=False, error=None,
+                          optional=True):
     """A path cannot be found but is optional."""
     src_struct = self.BAD_ELEMENTS
     dest_struct = []
-    path = chrome_util.Path(self.ELEMENT_SRC_NAME, optional=True)
-    self._CopyAndVerify(path, src_struct, dest_struct)
+    path = chrome_util.Path(self.ELEMENT_SRC_NAME, cond=cond, optional=optional)
+    self._CopyAndVerify(path, src_struct, dest_struct, error=error,
+                        strict=strict)
+
+  def testElementOptionalStrict(self):
+    """A path cannot be found but is optional, with --strict."""
+    self.testElementOptional(strict=True)
+
+  def testElementConditionalOK(self):
+    """A path cannot be found but has a condition, no --strict."""
+    self.testElementOptional(cond=lambda *args: True, optional=False)
+
+  def testElementConditionalFail(self):
+    """A path cannot be found but has a condition, with --strict."""
+    self.testElementOptional(cond=lambda *args: True, strict=True,
+                             optional=False, error=chrome_util.MissingPathError)
 
   def testOptionalGlob(self):
     """A glob matches nothing but is optional."""
@@ -181,12 +197,14 @@ class FileCopyTest(CopyTest):
 class SloppyFileCopyTest(FileCopyTest):
   """Test file copies with sloppy=True"""
 
-  def _CopyAndVerify(self, path, src_struct, dest_struct, error=None,
-                     strict=False, sloppy=True):
-    if error is chrome_util.MissingPathError:
-      error = None
-    CopyTest._CopyAndVerify(self, path, src_struct, dest_struct, error=error,
-                            strict=strict, sloppy=sloppy)
+  def _CopyAndVerify(self, path, src_struct, dest_struct, **kwargs):
+    if not kwargs.get('sloppy'):
+      kwargs['strict'] = False
+      kwargs['sloppy'] = True
+
+    if kwargs.get('error') is chrome_util.MissingPathError:
+      kwargs['error'] = None
+    CopyTest._CopyAndVerify(self, path, src_struct, dest_struct, **kwargs)
 
 
 class DirCopyTest(FileCopyTest):
@@ -196,7 +214,9 @@ class DirCopyTest(FileCopyTest):
   ELEMENT_SRC_NAME = 'monkey1/'
   ELEMENT_SRC = Dir(ELEMENT_SRC_NAME, FILES)
   ELEMENTS_SRC = [
-      Dir('monkey1', FILES) , Dir('monkey2', FILES), Dir('monkey3', FILES),
+      # Add .svn directory to test black list functionality.
+      Dir('monkey1', FILES + [Dir('.svn', FILES)]) , Dir('monkey2', FILES),
+      Dir('monkey3', FILES),
       Dir('foon1', []), Dir('foon2', []), Dir('foon3', [])]
   ELEMENTS_GLOB = 'monkey*'
   DIR_SRC_NAME = 'dir_src'
